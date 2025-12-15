@@ -387,6 +387,12 @@
             const [marketplaceTestResults, setMarketplaceTestResults] = useState({});
             const [marketplaceTestingCommand, setMarketplaceTestingCommand] = useState(null);
 
+            // Migration Console and curl panel state
+            const [migrationConsoleMinimized, setMigrationConsoleMinimized] = useState(false);
+            const [migrationCurlMinimized, setMigrationCurlMinimized] = useState(true);
+            const [migrationCommandHistory, setMigrationCommandHistory] = useState([]);
+            const [migrationShowSensitive, setMigrationShowSensitive] = useState(false);
+
             // Knowledge Editor state
             const [knowledgeEditorMinimized, setKnowledgeEditorMinimized] = useState(true);
             const [editedKnowledgeName, setEditedKnowledgeName] = useState('');
@@ -461,6 +467,46 @@
             const [targetVersion, setTargetVersion] = useState(null);
             const [showApiTokenHelp, setShowApiTokenHelp] = useState(false);
             const [showReadme, setShowReadme] = useState(false);
+
+            // Migration Wizard State
+            const [migrationStep, setMigrationStep] = useState(1); // 1=Connect, 2=Select, 3=Review, 4=Migrate, 5=Done
+            const [migrationSource, setMigrationSource] = useState({ clientId: '', clientSecret: '', orgId: '', sslVerify: true });
+            const [migrationDest, setMigrationDest] = useState({ clientId: '', clientSecret: '', orgId: '', sslVerify: true });
+            const [migrationSourceConnected, setMigrationSourceConnected] = useState(false);
+            const [migrationDestConnected, setMigrationDestConnected] = useState(false);
+            const [migrationSourceGroups, setMigrationSourceGroups] = useState({ stream: [], edge: [] });
+            const [migrationDestGroups, setMigrationDestGroups] = useState({ stream: [], edge: [] });
+            const [migrationSelectedTypes, setMigrationSelectedTypes] = useState({});
+            const [migrationSelectedGroups, setMigrationSelectedGroups] = useState({});
+            const [migrationGroupMap, setMigrationGroupMap] = useState({}); // source -> dest mapping
+            const [migrationDryRun, setMigrationDryRun] = useState(false);
+            const [migrationProgress, setMigrationProgress] = useState({ phase: '', current: 0, total: 0, items: [] });
+            const [migrationResults, setMigrationResults] = useState({ success: 0, failed: 0, items: [] });
+            const [migrationConnecting, setMigrationConnecting] = useState(false);
+            const [migrationRunning, setMigrationRunning] = useState(false);
+            const [migrationError, setMigrationError] = useState('');
+            const [showSourceSecret, setShowSourceSecret] = useState(false);
+            const [showDestSecret, setShowDestSecret] = useState(false);
+
+            // Migration config types - IDs must match backend (app.py all_config_types and all_knowledge_types)
+            const MIGRATION_CONFIG_TYPES = [
+                // Core config types
+                { id: 'pipelines', label: 'Pipelines', icon: 'fa-stream', description: 'Data pipelines' },
+                { id: 'routes', label: 'Routes', icon: 'fa-route', description: 'Routing rules' },
+                { id: 'inputs', label: 'Inputs', icon: 'fa-sign-in-alt', description: 'Data inputs' },
+                { id: 'outputs', label: 'Outputs', icon: 'fa-sign-out-alt', description: 'Data outputs' },
+                { id: 'lookups', label: 'Lookups', icon: 'fa-table', description: 'Lookup tables (CSV)' },
+                // Knowledge types
+                { id: 'parsers', label: 'Parsers', icon: 'fa-code', description: 'Parser definitions' },
+                { id: 'breakers', label: 'Event Breakers', icon: 'fa-cut', description: 'Event breaker rules' },
+                { id: 'regexes', label: 'Regexes', icon: 'fa-asterisk', description: 'Regex patterns' },
+                { id: 'grokPatterns', label: 'Grok Patterns', icon: 'fa-puzzle-piece', description: 'Grok extraction patterns' },
+                { id: 'schemas', label: 'Schemas', icon: 'fa-database', description: 'Schema definitions' },
+                { id: 'parquetSchemas', label: 'Parquet Schemas', icon: 'fa-file-alt', description: 'Parquet schema definitions' },
+                { id: 'globalVars', label: 'Global Variables', icon: 'fa-globe', description: 'Global variables' },
+                { id: 'dbConnections', label: 'Database Connections', icon: 'fa-plug', description: 'Database connections' },
+                { id: 'appscopeConfigs', label: 'AppScope Configs', icon: 'fa-cogs', description: 'AppScope configurations' },
+            ];
 
             // Marketplace API functions
             const loadMarketplaceProviders = async () => {
@@ -4079,6 +4125,36 @@
                                             <i className={`fas fa-store text-xs ${sidebarCollapsed ? '' : 'mr-2 w-3'}`}></i>
                                             {!sidebarCollapsed && <span className="truncate">Marketplace</span>}
                                         </button>
+
+                                        {/* Tools Divider and Buttons */}
+                                        <div className={`my-2 border-t ${darkMode ? 'border-gray-700' : 'border-gray-300'}`}></div>
+                                        {!sidebarCollapsed && (
+                                            <span className={`text-[10px] font-semibold uppercase tracking-wider ${textSecondaryClass} px-1 mb-1 block`}>Tools</span>
+                                        )}
+                                        <button
+                                            onClick={() => setSelectedKnowledgeType('migration')}
+                                            className={`w-full flex items-center ${sidebarCollapsed ? 'justify-center px-1' : 'px-2'} py-1.5 rounded-lg text-xs transition-all ${
+                                                selectedKnowledgeType === 'migration'
+                                                    ? 'bg-orange-600 text-white'
+                                                    : (darkMode ? 'hover:bg-gray-700 text-gray-300' : 'hover:bg-gray-100 text-gray-700')
+                                            }`}
+                                            title="Migration"
+                                        >
+                                            <i className={`fas fa-exchange-alt text-xs ${sidebarCollapsed ? '' : 'mr-2 w-3'}`}></i>
+                                            {!sidebarCollapsed && <span className="truncate">Migration</span>}
+                                        </button>
+                                        <button
+                                            onClick={() => setSelectedKnowledgeType('snapshots')}
+                                            className={`w-full flex items-center ${sidebarCollapsed ? 'justify-center px-1' : 'px-2'} py-1.5 rounded-lg text-xs transition-all ${
+                                                selectedKnowledgeType === 'snapshots'
+                                                    ? 'bg-green-600 text-white'
+                                                    : (darkMode ? 'hover:bg-gray-700 text-gray-300' : 'hover:bg-gray-100 text-gray-700')
+                                            }`}
+                                            title="Snapshots"
+                                        >
+                                            <i className={`fas fa-camera text-xs ${sidebarCollapsed ? '' : 'mr-2 w-3'}`}></i>
+                                            {!sidebarCollapsed && <span className="truncate">Snapshots</span>}
+                                        </button>
                                     </div>
                                 </div>
 
@@ -6724,6 +6800,789 @@
                                                     </div>
                                                 </div>
                                             )}
+                                        </div>
+                                    ) : selectedKnowledgeType === 'migration' ? (
+                                        /* Migration Wizard Interface */
+                                        <div className="grid gap-4 min-w-0">
+                                            <div className={`${cardClass} rounded-xl p-6 overflow-hidden`}>
+                                                {/* Header */}
+                                                <div className={`flex items-center justify-between pb-4 mb-4 border-b ${darkMode ? 'border-gray-700' : 'border-gray-300'}`}>
+                                                    <div className="flex items-center space-x-3">
+                                                        <div className={`p-2 rounded-lg ${darkMode ? 'bg-orange-900' : 'bg-orange-100'}`}>
+                                                            <i className={`fas fa-exchange-alt text-lg ${darkMode ? 'text-orange-400' : 'text-orange-600'}`}></i>
+                                                        </div>
+                                                        <div>
+                                                            <h3 className={`text-lg font-bold ${textClass}`}>Org-to-Org Migration</h3>
+                                                            <p className={`text-xs ${textSecondaryClass}`}>Migrate configurations between Cribl Cloud organizations</p>
+                                                        </div>
+                                                    </div>
+                                                    {migrationStep > 1 && migrationStep < 5 && (
+                                                        <button
+                                                            onClick={() => {
+                                                                setMigrationStep(1);
+                                                                setMigrationSourceConnected(false);
+                                                                setMigrationDestConnected(false);
+                                                                setMigrationError('');
+                                                            }}
+                                                            className={`px-3 py-1.5 text-xs rounded-lg ${darkMode ? 'bg-gray-700 hover:bg-gray-600 text-gray-300' : 'bg-gray-200 hover:bg-gray-300 text-gray-700'}`}
+                                                        >
+                                                            <i className="fas fa-redo mr-1"></i> Start Over
+                                                        </button>
+                                                    )}
+                                                </div>
+
+                                                {/* Step Indicator */}
+                                                <div className="flex items-center justify-center mb-6">
+                                                    {[
+                                                        { num: 1, label: 'Connect' },
+                                                        { num: 2, label: 'Select' },
+                                                        { num: 3, label: 'Review' },
+                                                        { num: 4, label: 'Migrate' },
+                                                        { num: 5, label: 'Done' }
+                                                    ].map((step, idx) => (
+                                                        <React.Fragment key={step.num}>
+                                                            <div className="flex flex-col items-center">
+                                                                <div className={`w-8 h-8 rounded-full flex items-center justify-center text-sm font-semibold transition-all ${
+                                                                    migrationStep === step.num ? 'bg-orange-600 text-white' :
+                                                                    migrationStep > step.num ? 'bg-green-600 text-white' :
+                                                                    darkMode ? 'bg-gray-700 text-gray-400' : 'bg-gray-200 text-gray-500'
+                                                                }`}>
+                                                                    {migrationStep > step.num ? <i className="fas fa-check"></i> : step.num}
+                                                                </div>
+                                                                <span className={`text-xs mt-1 ${migrationStep === step.num ? 'text-orange-500 font-semibold' : textSecondaryClass}`}>{step.label}</span>
+                                                            </div>
+                                                            {idx < 4 && (
+                                                                <div className={`w-12 h-0.5 mx-1 ${migrationStep > step.num ? 'bg-green-600' : darkMode ? 'bg-gray-700' : 'bg-gray-200'}`}></div>
+                                                            )}
+                                                        </React.Fragment>
+                                                    ))}
+                                                </div>
+
+                                                {/* Error Display */}
+                                                {migrationError && (
+                                                    <div className="mb-4 p-3 bg-red-900/30 border border-red-600 rounded-lg text-red-400 text-sm">
+                                                        <i className="fas fa-exclamation-triangle mr-2"></i>{migrationError}
+                                                    </div>
+                                                )}
+
+                                                {/* Step 1: Connect */}
+                                                {migrationStep === 1 && (
+                                                    <div className="grid lg:grid-cols-2 gap-6">
+                                                        {/* Source Org */}
+                                                        <div className={`p-4 rounded-lg ${darkMode ? 'bg-gray-800' : 'bg-gray-100'}`}>
+                                                            <div className="flex items-center justify-between mb-3">
+                                                                <h4 className={`font-semibold ${textClass}`}><i className="fas fa-sign-out-alt mr-2 text-blue-500"></i>Source Organization</h4>
+                                                                <div className="flex items-center space-x-2">
+                                                                    <button
+                                                                        onClick={async () => {
+                                                                            try {
+                                                                                const res = await fetch(`${API_BASE}/api/config?full=true`);
+                                                                                const data = await res.json();
+                                                                                if (data.hasConfig && (data.client_id || data.client_secret || data.organization_id)) {
+                                                                                    setMigrationSource({
+                                                                                        ...migrationSource,
+                                                                                        clientId: data.client_id || '',
+                                                                                        clientSecret: data.client_secret || '',
+                                                                                        orgId: data.organization_id || ''
+                                                                                    });
+                                                                                } else {
+                                                                                    setMigrationError('No credentials found in config.ini');
+                                                                                }
+                                                                            } catch (err) {
+                                                                                setMigrationError('Failed to load config: ' + err.message);
+                                                                            }
+                                                                        }}
+                                                                        className="px-2 py-1 text-xs bg-blue-600 hover:bg-blue-700 text-white rounded transition-colors"
+                                                                        title="Load credentials from config.ini"
+                                                                    >
+                                                                        <i className="fas fa-file-import mr-1"></i>Load from config.ini
+                                                                    </button>
+                                                                    {migrationSourceConnected && <span className="text-green-500 text-xs"><i className="fas fa-check-circle mr-1"></i>Connected</span>}
+                                                                </div>
+                                                            </div>
+                                                            <div className="space-y-3">
+                                                                <div>
+                                                                    <label className={`block text-xs mb-1 ${textSecondaryClass}`}>Organization ID</label>
+                                                                    <input
+                                                                        type="text"
+                                                                        value={migrationSource.orgId}
+                                                                        onChange={(e) => setMigrationSource({...migrationSource, orgId: e.target.value})}
+                                                                        className={`w-full px-3 py-2 text-sm rounded-lg ${inputClass}`}
+                                                                        placeholder="e.g., main-your-org-name"
+                                                                    />
+                                                                </div>
+                                                                <div>
+                                                                    <label className={`block text-xs mb-1 ${textSecondaryClass}`}>Client ID</label>
+                                                                    <input
+                                                                        type="text"
+                                                                        value={migrationSource.clientId}
+                                                                        onChange={(e) => setMigrationSource({...migrationSource, clientId: e.target.value})}
+                                                                        className={`w-full px-3 py-2 text-sm rounded-lg ${inputClass}`}
+                                                                        placeholder="Enter Client ID"
+                                                                    />
+                                                                </div>
+                                                                <div>
+                                                                    <label className={`block text-xs mb-1 ${textSecondaryClass}`}>Client Secret</label>
+                                                                    <div className="relative">
+                                                                        <input
+                                                                            type={showSourceSecret ? 'text' : 'password'}
+                                                                            value={migrationSource.clientSecret}
+                                                                            onChange={(e) => setMigrationSource({...migrationSource, clientSecret: e.target.value})}
+                                                                            className={`w-full px-3 py-2 pr-10 text-sm rounded-lg ${inputClass}`}
+                                                                            placeholder="Enter Client Secret"
+                                                                        />
+                                                                        <button
+                                                                            type="button"
+                                                                            onClick={() => setShowSourceSecret(!showSourceSecret)}
+                                                                            className={`absolute right-2 top-1/2 -translate-y-1/2 p-1 ${textSecondaryClass} hover:${textClass}`}
+                                                                            title={showSourceSecret ? 'Hide secret' : 'Show secret'}
+                                                                        >
+                                                                            <i className={`fas ${showSourceSecret ? 'fa-eye-slash' : 'fa-eye'}`}></i>
+                                                                        </button>
+                                                                    </div>
+                                                                </div>
+                                                            </div>
+                                                        </div>
+
+                                                        {/* Destination Org */}
+                                                        <div className={`p-4 rounded-lg ${darkMode ? 'bg-gray-800' : 'bg-gray-100'}`}>
+                                                            <div className="flex items-center justify-between mb-3">
+                                                                <h4 className={`font-semibold ${textClass}`}><i className="fas fa-sign-in-alt mr-2 text-green-500"></i>Destination Organization</h4>
+                                                                <div className="flex items-center space-x-2">
+                                                                    <button
+                                                                        onClick={() => {
+                                                                            setMigrationDest({
+                                                                                ...migrationDest,
+                                                                                clientId: migrationSource.clientId,
+                                                                                clientSecret: migrationSource.clientSecret,
+                                                                                orgId: migrationSource.orgId
+                                                                            });
+                                                                        }}
+                                                                        disabled={!migrationSource.clientId && !migrationSource.clientSecret && !migrationSource.orgId}
+                                                                        className="px-2 py-1 text-xs bg-green-600 hover:bg-green-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded transition-colors"
+                                                                        title="Copy credentials from Source"
+                                                                    >
+                                                                        <i className="fas fa-copy mr-1"></i>Copy from Source
+                                                                    </button>
+                                                                    {migrationDestConnected && <span className="text-green-500 text-xs"><i className="fas fa-check-circle mr-1"></i>Connected</span>}
+                                                                </div>
+                                                            </div>
+                                                            <div className="space-y-3">
+                                                                <div>
+                                                                    <label className={`block text-xs mb-1 ${textSecondaryClass}`}>Organization ID</label>
+                                                                    <input
+                                                                        type="text"
+                                                                        value={migrationDest.orgId}
+                                                                        onChange={(e) => setMigrationDest({...migrationDest, orgId: e.target.value})}
+                                                                        className={`w-full px-3 py-2 text-sm rounded-lg ${inputClass}`}
+                                                                        placeholder="e.g., main-your-org-name"
+                                                                    />
+                                                                </div>
+                                                                <div>
+                                                                    <label className={`block text-xs mb-1 ${textSecondaryClass}`}>Client ID</label>
+                                                                    <input
+                                                                        type="text"
+                                                                        value={migrationDest.clientId}
+                                                                        onChange={(e) => setMigrationDest({...migrationDest, clientId: e.target.value})}
+                                                                        className={`w-full px-3 py-2 text-sm rounded-lg ${inputClass}`}
+                                                                        placeholder="Enter Client ID"
+                                                                    />
+                                                                </div>
+                                                                <div>
+                                                                    <label className={`block text-xs mb-1 ${textSecondaryClass}`}>Client Secret</label>
+                                                                    <div className="relative">
+                                                                        <input
+                                                                            type={showDestSecret ? 'text' : 'password'}
+                                                                            value={migrationDest.clientSecret}
+                                                                            onChange={(e) => setMigrationDest({...migrationDest, clientSecret: e.target.value})}
+                                                                            className={`w-full px-3 py-2 pr-10 text-sm rounded-lg ${inputClass}`}
+                                                                            placeholder="Enter Client Secret"
+                                                                        />
+                                                                        <button
+                                                                            type="button"
+                                                                            onClick={() => setShowDestSecret(!showDestSecret)}
+                                                                            className={`absolute right-2 top-1/2 -translate-y-1/2 p-1 ${textSecondaryClass} hover:${textClass}`}
+                                                                            title={showDestSecret ? 'Hide secret' : 'Show secret'}
+                                                                        >
+                                                                            <i className={`fas ${showDestSecret ? 'fa-eye-slash' : 'fa-eye'}`}></i>
+                                                                        </button>
+                                                                    </div>
+                                                                </div>
+                                                            </div>
+                                                        </div>
+
+                                                        {/* Connect Button */}
+                                                        <div className="lg:col-span-2 flex justify-center">
+                                                            <button
+                                                                onClick={async () => {
+                                                                    setMigrationConnecting(true);
+                                                                    setMigrationError('');
+                                                                    try {
+                                                                        // Test source connection
+                                                                        const srcRes = await fetch(`${API_BASE}/api/org-migration/test-connection`, {
+                                                                            method: 'POST',
+                                                                            headers: { 'Content-Type': 'application/json' },
+                                                                            body: JSON.stringify({
+                                                                                clientId: migrationSource.clientId,
+                                                                                clientSecret: migrationSource.clientSecret,
+                                                                                orgId: migrationSource.orgId
+                                                                            })
+                                                                        });
+                                                                        const srcData = await srcRes.json();
+                                                                        if (!srcData.success) throw new Error('Source: ' + (srcData.error || 'Connection failed'));
+                                                                        setMigrationSourceConnected(true);
+                                                                        setMigrationSourceGroups({ stream: srcData.stream_groups || [], edge: srcData.edge_fleets || [] });
+
+                                                                        // Test destination connection
+                                                                        const dstRes = await fetch(`${API_BASE}/api/org-migration/test-connection`, {
+                                                                            method: 'POST',
+                                                                            headers: { 'Content-Type': 'application/json' },
+                                                                            body: JSON.stringify({
+                                                                                clientId: migrationDest.clientId,
+                                                                                clientSecret: migrationDest.clientSecret,
+                                                                                orgId: migrationDest.orgId
+                                                                            })
+                                                                        });
+                                                                        const dstData = await dstRes.json();
+                                                                        if (!dstData.success) throw new Error('Destination: ' + (dstData.error || 'Connection failed'));
+                                                                        setMigrationDestConnected(true);
+                                                                        setMigrationDestGroups({ stream: dstData.stream_groups || [], edge: dstData.edge_fleets || [] });
+
+                                                                        // Initialize group selection (not auto-selected)
+                                                                        setMigrationSelectedGroups({});
+
+                                                                        // Initialize type selection (not auto-selected)
+                                                                        setMigrationSelectedTypes({});
+
+                                                                        setMigrationStep(2);
+                                                                    } catch (err) {
+                                                                        setMigrationError(err.message);
+                                                                    } finally {
+                                                                        setMigrationConnecting(false);
+                                                                    }
+                                                                }}
+                                                                disabled={migrationConnecting || !migrationSource.clientId || !migrationSource.clientSecret || !migrationSource.orgId || !migrationDest.clientId || !migrationDest.clientSecret || !migrationDest.orgId}
+                                                                className="px-6 py-2.5 bg-orange-600 hover:bg-orange-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg font-semibold transition-all flex items-center space-x-2"
+                                                            >
+                                                                {migrationConnecting ? <><i className="fas fa-spinner fa-spin mr-2"></i>Connecting...</> : <><i className="fas fa-plug mr-2"></i>Connect &amp; Continue</>}
+                                                            </button>
+                                                        </div>
+                                                    </div>
+                                                )}
+
+                                                {/* Step 2: Select */}
+                                                {migrationStep === 2 && (
+                                                    <div className="space-y-6">
+                                                        {/* Config Types */}
+                                                        <div>
+                                                            <h4 className={`font-semibold mb-3 ${textClass}`}><i className="fas fa-list-check mr-2"></i>Select Configuration Types</h4>
+                                                            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-2">
+                                                                {MIGRATION_CONFIG_TYPES.map(type => (
+                                                                    <label key={type.id} className={`flex items-center p-2 rounded-lg cursor-pointer transition-all ${
+                                                                        migrationSelectedTypes[type.id]
+                                                                            ? (darkMode ? 'bg-orange-900/50 border border-orange-600' : 'bg-orange-100 border border-orange-400')
+                                                                            : (darkMode ? 'bg-gray-800 hover:bg-gray-700' : 'bg-gray-100 hover:bg-gray-200')
+                                                                    }`}>
+                                                                        <input
+                                                                            type="checkbox"
+                                                                            checked={!!migrationSelectedTypes[type.id]}
+                                                                            onChange={(e) => setMigrationSelectedTypes({...migrationSelectedTypes, [type.id]: e.target.checked})}
+                                                                            className="mr-2"
+                                                                        />
+                                                                        <i className={`fas ${type.icon} mr-2 text-xs ${darkMode ? 'text-gray-400' : 'text-gray-500'}`}></i>
+                                                                        <span className={`text-xs ${textClass}`}>{type.label}</span>
+                                                                    </label>
+                                                                ))}
+                                                            </div>
+                                                        </div>
+
+                                                        {/* Non-migratable items warning */}
+                                                        <div className={`p-4 rounded-lg ${darkMode ? 'bg-amber-900/30 border border-amber-600' : 'bg-amber-50 border border-amber-300'}`}>
+                                                            <div className="flex items-start">
+                                                                <i className={`fas fa-exclamation-triangle mr-3 mt-0.5 ${darkMode ? 'text-amber-400' : 'text-amber-600'}`}></i>
+                                                                <div>
+                                                                    <h5 className={`font-semibold text-sm ${darkMode ? 'text-amber-400' : 'text-amber-700'}`}>Items Not Migrated via API</h5>
+                                                                    <p className={`text-xs mt-1 ${darkMode ? 'text-amber-300' : 'text-amber-600'}`}>
+                                                                        The following items cannot be migrated via the API and must be configured manually in the destination:
+                                                                    </p>
+                                                                    <ul className={`text-xs mt-2 space-y-1 ${darkMode ? 'text-amber-300' : 'text-amber-600'}`}>
+                                                                        <li><i className="fas fa-key mr-1"></i><strong>Secrets</strong> - API credentials, passwords, encryption keys</li>
+                                                                        <li><i className="fas fa-certificate mr-1"></i><strong>Certificates</strong> - TLS/SSL certificates and private keys</li>
+                                                                        <li><i className="fas fa-users mr-1"></i><strong>Users &amp; Roles</strong> - Local user accounts and RBAC assignments</li>
+                                                                        <li><i className="fas fa-id-card mr-1"></i><strong>Identity Providers</strong> - SSO/SAML/OIDC configurations</li>
+                                                                        <li><i className="fas fa-shield-alt mr-1"></i><strong>Git Settings</strong> - Repository connections and deploy keys</li>
+                                                                    </ul>
+                                                                </div>
+                                                            </div>
+                                                        </div>
+
+                                                        {/* Worker Groups */}
+                                                        <div className="grid lg:grid-cols-2 gap-4">
+                                                            {/* Stream Groups */}
+                                                            {migrationSourceGroups.stream.length > 0 && (
+                                                                <div className={`p-4 rounded-lg ${darkMode ? 'bg-gray-800' : 'bg-gray-100'}`}>
+                                                                    <h5 className={`font-semibold mb-2 text-sm ${textClass}`}><i className="fas fa-stream mr-2 text-blue-500"></i>Stream Worker Groups</h5>
+                                                                    <p className={`text-xs mb-2 ${textSecondaryClass}`}>Optionally rename groups on destination</p>
+                                                                    <div className="space-y-2 max-h-48 overflow-y-auto">
+                                                                        {[...migrationSourceGroups.stream].sort().map(g => (
+                                                                            <div key={g} className="flex items-center gap-2">
+                                                                                <input
+                                                                                    type="checkbox"
+                                                                                    checked={!!migrationSelectedGroups[`stream:${g}`]}
+                                                                                    onChange={(e) => setMigrationSelectedGroups({...migrationSelectedGroups, [`stream:${g}`]: e.target.checked})}
+                                                                                    className="flex-shrink-0"
+                                                                                />
+                                                                                <span className={`text-sm flex-shrink-0 w-32 truncate ${textSecondaryClass}`} title={g}>{g}</span>
+                                                                                <i className={`fas fa-arrow-right text-xs ${textSecondaryClass}`}></i>
+                                                                                <input
+                                                                                    type="text"
+                                                                                    placeholder={g}
+                                                                                    value={migrationGroupMap[`stream:${g}`] || ''}
+                                                                                    onChange={(e) => setMigrationGroupMap({...migrationGroupMap, [`stream:${g}`]: e.target.value})}
+                                                                                    disabled={!migrationSelectedGroups[`stream:${g}`]}
+                                                                                    className={`flex-1 px-2 py-1 text-xs rounded border ${darkMode ? 'bg-gray-700 border-gray-600 text-white placeholder-gray-500' : 'bg-white border-gray-300 text-gray-900 placeholder-gray-400'} ${!migrationSelectedGroups[`stream:${g}`] ? 'opacity-50' : ''}`}
+                                                                                />
+                                                                            </div>
+                                                                        ))}
+                                                                    </div>
+                                                                </div>
+                                                            )}
+
+                                                            {/* Edge Fleets */}
+                                                            {migrationSourceGroups.edge.length > 0 && (
+                                                                <div className={`p-4 rounded-lg ${darkMode ? 'bg-gray-800' : 'bg-gray-100'}`}>
+                                                                    <h5 className={`font-semibold mb-2 text-sm ${textClass}`}><i className="fas fa-satellite-dish mr-2 text-purple-500"></i>Edge Fleets</h5>
+                                                                    <p className={`text-xs mb-2 ${textSecondaryClass}`}>Optionally rename fleets on destination</p>
+                                                                    <div className="space-y-2 max-h-48 overflow-y-auto">
+                                                                        {[...migrationSourceGroups.edge].sort().map(g => (
+                                                                            <div key={g} className="flex items-center gap-2">
+                                                                                <input
+                                                                                    type="checkbox"
+                                                                                    checked={!!migrationSelectedGroups[`edge:${g}`]}
+                                                                                    onChange={(e) => setMigrationSelectedGroups({...migrationSelectedGroups, [`edge:${g}`]: e.target.checked})}
+                                                                                    className="flex-shrink-0"
+                                                                                />
+                                                                                <span className={`text-sm flex-shrink-0 w-32 truncate ${textSecondaryClass}`} title={g}>{g}</span>
+                                                                                <i className={`fas fa-arrow-right text-xs ${textSecondaryClass}`}></i>
+                                                                                <input
+                                                                                    type="text"
+                                                                                    placeholder={g}
+                                                                                    value={migrationGroupMap[`edge:${g}`] || ''}
+                                                                                    onChange={(e) => setMigrationGroupMap({...migrationGroupMap, [`edge:${g}`]: e.target.value})}
+                                                                                    disabled={!migrationSelectedGroups[`edge:${g}`]}
+                                                                                    className={`flex-1 px-2 py-1 text-xs rounded border ${darkMode ? 'bg-gray-700 border-gray-600 text-white placeholder-gray-500' : 'bg-white border-gray-300 text-gray-900 placeholder-gray-400'} ${!migrationSelectedGroups[`edge:${g}`] ? 'opacity-50' : ''}`}
+                                                                                />
+                                                                            </div>
+                                                                        ))}
+                                                                    </div>
+                                                                </div>
+                                                            )}
+                                                        </div>
+
+                                                        {/* Navigation */}
+                                                        <div className="flex justify-between">
+                                                            <button onClick={() => setMigrationStep(1)} className={`px-4 py-2 text-sm rounded-lg ${darkMode ? 'bg-gray-700 hover:bg-gray-600' : 'bg-gray-200 hover:bg-gray-300'} ${textClass}`}>
+                                                                <i className="fas fa-arrow-left mr-2"></i>Back
+                                                            </button>
+                                                            <button
+                                                                onClick={() => setMigrationStep(3)}
+                                                                disabled={!Object.values(migrationSelectedTypes).some(v => v) || !Object.values(migrationSelectedGroups).some(v => v)}
+                                                                className="px-6 py-2 bg-orange-600 hover:bg-orange-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg font-semibold"
+                                                            >
+                                                                Continue<i className="fas fa-arrow-right ml-2"></i>
+                                                            </button>
+                                                        </div>
+                                                    </div>
+                                                )}
+
+                                                {/* Step 3: Review */}
+                                                {migrationStep === 3 && (
+                                                    <div className="space-y-4">
+                                                        <div className="grid lg:grid-cols-2 gap-4">
+                                                            <div className={`p-4 rounded-lg ${darkMode ? 'bg-gray-800' : 'bg-gray-100'}`}>
+                                                                <h5 className={`font-semibold mb-2 ${textClass}`}>Source</h5>
+                                                                <p className={`text-sm ${textSecondaryClass}`}>{migrationSource.orgId}</p>
+                                                            </div>
+                                                            <div className={`p-4 rounded-lg ${darkMode ? 'bg-gray-800' : 'bg-gray-100'}`}>
+                                                                <h5 className={`font-semibold mb-2 ${textClass}`}>Destination</h5>
+                                                                <p className={`text-sm ${textSecondaryClass}`}>{migrationDest.orgId}</p>
+                                                            </div>
+                                                        </div>
+
+                                                        <div className={`p-4 rounded-lg ${darkMode ? 'bg-gray-800' : 'bg-gray-100'}`}>
+                                                            <h5 className={`font-semibold mb-2 ${textClass}`}>Config Types to Migrate</h5>
+                                                            <div className="flex flex-wrap gap-2">
+                                                                {MIGRATION_CONFIG_TYPES.filter(t => migrationSelectedTypes[t.id]).map(t => (
+                                                                    <span key={t.id} className="px-2 py-1 bg-orange-600 text-white text-xs rounded">{t.label}</span>
+                                                                ))}
+                                                            </div>
+                                                        </div>
+
+                                                        <div className={`p-4 rounded-lg ${darkMode ? 'bg-gray-800' : 'bg-gray-100'}`}>
+                                                            <h5 className={`font-semibold mb-2 ${textClass}`}>Worker Groups / Fleets</h5>
+                                                            <div className="flex flex-wrap gap-2">
+                                                                {Object.entries(migrationSelectedGroups).filter(([_, v]) => v).map(([k]) => (
+                                                                    <span key={k} className={`px-2 py-1 text-xs rounded ${k.startsWith('stream:') ? 'bg-blue-600' : 'bg-purple-600'} text-white`}>
+                                                                        {k.replace('stream:', '').replace('edge:', '')}
+                                                                    </span>
+                                                                ))}
+                                                            </div>
+                                                        </div>
+
+                                                        {/* Dry Run Toggle */}
+                                                        <div className={`p-4 rounded-lg ${darkMode ? 'bg-yellow-900/30 border border-yellow-600' : 'bg-yellow-50 border border-yellow-300'}`}>
+                                                            <label className="flex items-center cursor-pointer">
+                                                                <input
+                                                                    type="checkbox"
+                                                                    checked={migrationDryRun}
+                                                                    onChange={(e) => setMigrationDryRun(e.target.checked)}
+                                                                    className="mr-3 w-5 h-5"
+                                                                />
+                                                                <div>
+                                                                    <span className={`font-semibold ${darkMode ? 'text-yellow-400' : 'text-yellow-700'}`}>Dry Run (Simulation Mode)</span>
+                                                                    <p className={`text-xs ${darkMode ? 'text-yellow-300' : 'text-yellow-600'}`}>Preview changes without actually migrating. Recommended for first run.</p>
+                                                                </div>
+                                                            </label>
+                                                        </div>
+
+                                                        {/* Navigation */}
+                                                        <div className="flex justify-between">
+                                                            <button onClick={() => setMigrationStep(2)} className={`px-4 py-2 text-sm rounded-lg ${darkMode ? 'bg-gray-700 hover:bg-gray-600' : 'bg-gray-200 hover:bg-gray-300'} ${textClass}`}>
+                                                                <i className="fas fa-arrow-left mr-2"></i>Back
+                                                            </button>
+                                                            <button
+                                                                onClick={async () => {
+                                                                    setMigrationStep(4);
+                                                                    setMigrationRunning(true);
+                                                                    setMigrationProgress({ phase: 'Starting migration...', current: 0, total: 0, items: [] });
+                                                                    setMigrationResults({ success: 0, failed: 0, items: [] });
+
+                                                                    try {
+                                                                        const response = await fetch(`${API_BASE}/api/org-migration/migrate`, {
+                                                                            method: 'POST',
+                                                                            headers: { 'Content-Type': 'application/json' },
+                                                                            body: JSON.stringify({
+                                                                                source: migrationSource,
+                                                                                destination: migrationDest,
+                                                                                selectedTypes: migrationSelectedTypes,
+                                                                                selectedGroups: migrationSelectedGroups,
+                                                                                groupMap: migrationGroupMap,
+                                                                                simulateOnly: migrationDryRun
+                                                                            })
+                                                                        });
+
+                                                                        const reader = response.body.getReader();
+                                                                        const decoder = new TextDecoder();
+                                                                        let successCount = 0, failCount = 0, resultItems = [];
+
+                                                                        while (true) {
+                                                                            const { done, value } = await reader.read();
+                                                                            if (done) break;
+                                                                            const chunk = decoder.decode(value);
+                                                                            const lines = chunk.split('\n').filter(l => l.startsWith('data: '));
+                                                                            for (const line of lines) {
+                                                                                try {
+                                                                                    const event = JSON.parse(line.slice(6));
+                                                                                    if (event.type === 'progress') {
+                                                                                        setMigrationProgress(prev => ({ ...prev, phase: event.phase || prev.phase, current: event.current ?? prev.current, total: event.total ?? prev.total }));
+                                                                                    } else if (event.type === 'item') {
+                                                                                        resultItems.push(event);
+                                                                                        if (event.status === 'success') successCount++; else failCount++;
+                                                                                        setMigrationResults({ success: successCount, failed: failCount, items: [...resultItems] });
+                                                                                    } else if (event.type === 'complete') {
+                                                                                        setMigrationResults(prev => ({ ...prev, success: event.success_count || successCount, failed: event.fail_count || failCount }));
+                                                                                    }
+                                                                                } catch (e) { /* ignore parse errors */ }
+                                                                            }
+                                                                        }
+                                                                    } catch (err) {
+                                                                        setMigrationError(err.message);
+                                                                    } finally {
+                                                                        setMigrationRunning(false);
+                                                                        setMigrationStep(5);
+                                                                    }
+                                                                }}
+                                                                className="px-6 py-2 bg-orange-600 hover:bg-orange-700 text-white rounded-lg font-semibold"
+                                                            >
+                                                                {migrationDryRun ? 'Run Simulation' : 'Start Migration'}<i className="fas fa-play ml-2"></i>
+                                                            </button>
+                                                        </div>
+                                                    </div>
+                                                )}
+
+                                                {/* Step 4: Migrate (Progress) */}
+                                                {migrationStep === 4 && (
+                                                    <div className="space-y-4">
+                                                        <div className={`text-center py-8 ${textSecondaryClass}`}>
+                                                            {migrationRunning && <i className="fas fa-spinner fa-spin text-4xl text-orange-500 mb-4"></i>}
+                                                            <h4 className={`text-lg font-semibold ${textClass}`}>{migrationDryRun ? 'Running Simulation...' : 'Migration in Progress...'}</h4>
+                                                            <p className="text-sm mt-2">{migrationProgress.phase}</p>
+                                                            {migrationProgress.total > 0 && (
+                                                                <div className="mt-4 max-w-md mx-auto">
+                                                                    <div className="w-full bg-gray-700 rounded-full h-2">
+                                                                        <div className="bg-orange-600 h-2 rounded-full transition-all" style={{ width: `${(migrationProgress.current / migrationProgress.total) * 100}%` }}></div>
+                                                                    </div>
+                                                                    <p className="text-xs mt-1">{migrationProgress.current} / {migrationProgress.total}</p>
+                                                                </div>
+                                                            )}
+                                                        </div>
+
+                                                        {/* Live Results */}
+                                                        {migrationResults.items.length > 0 && (
+                                                            <div className={`p-4 rounded-lg max-h-60 overflow-y-auto ${darkMode ? 'bg-gray-800' : 'bg-gray-100'}`}>
+                                                                <div className="flex justify-between mb-2">
+                                                                    <span className="text-green-500 text-sm"><i className="fas fa-check-circle mr-1"></i>{migrationResults.success} succeeded</span>
+                                                                    <span className="text-red-500 text-sm"><i className="fas fa-times-circle mr-1"></i>{migrationResults.failed} failed</span>
+                                                                </div>
+                                                                <div className="space-y-1">
+                                                                    {migrationResults.items.slice(-20).map((item, idx) => (
+                                                                        <div key={idx} className={`text-xs flex items-center ${item.status === 'success' ? 'text-green-400' : 'text-red-400'}`}>
+                                                                            <i className={`fas ${item.status === 'success' ? 'fa-check' : 'fa-times'} mr-2 w-3`}></i>
+                                                                            <span className="truncate">{item.item_type}: {item.item_id || item.message}</span>
+                                                                        </div>
+                                                                    ))}
+                                                                </div>
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                )}
+
+                                                {/* Step 5: Done */}
+                                                {migrationStep === 5 && (
+                                                    <div className="space-y-4">
+                                                        <div className={`text-center py-8 ${textSecondaryClass}`}>
+                                                            <i className={`fas ${migrationResults.failed === 0 ? 'fa-check-circle text-green-500' : 'fa-exclamation-circle text-yellow-500'} text-5xl mb-4`}></i>
+                                                            <h4 className={`text-lg font-semibold ${textClass}`}>
+                                                                {migrationDryRun ? 'Simulation Complete' : 'Migration Complete'}
+                                                            </h4>
+                                                            <div className="flex justify-center gap-8 mt-4">
+                                                                <div className="text-center">
+                                                                    <p className="text-3xl font-bold text-green-500">{migrationResults.success}</p>
+                                                                    <p className="text-xs">Succeeded</p>
+                                                                </div>
+                                                                <div className="text-center">
+                                                                    <p className="text-3xl font-bold text-red-500">{migrationResults.failed}</p>
+                                                                    <p className="text-xs">Failed</p>
+                                                                </div>
+                                                            </div>
+                                                        </div>
+
+                                                        {/* Results List */}
+                                                        {migrationResults.items.length > 0 && (
+                                                            <div className={`p-4 rounded-lg max-h-60 overflow-y-auto ${darkMode ? 'bg-gray-800' : 'bg-gray-100'}`}>
+                                                                <h5 className={`font-semibold mb-2 ${textClass}`}>Results</h5>
+                                                                <div className="space-y-1">
+                                                                    {migrationResults.items.map((item, idx) => (
+                                                                        <div key={idx} className={`text-xs flex items-center ${item.status === 'success' ? 'text-green-400' : 'text-red-400'}`}>
+                                                                            <i className={`fas ${item.status === 'success' ? 'fa-check' : 'fa-times'} mr-2 w-3`}></i>
+                                                                            <span className="truncate">{item.item_type}: {item.item_id || item.message}</span>
+                                                                        </div>
+                                                                    ))}
+                                                                </div>
+                                                            </div>
+                                                        )}
+
+                                                        {/* Actions */}
+                                                        <div className="flex justify-center gap-4">
+                                                            <button
+                                                                onClick={() => {
+                                                                    setMigrationStep(1);
+                                                                    setMigrationSourceConnected(false);
+                                                                    setMigrationDestConnected(false);
+                                                                    setMigrationSource({ clientId: '', clientSecret: '', orgId: '', sslVerify: true });
+                                                                    setMigrationDest({ clientId: '', clientSecret: '', orgId: '', sslVerify: true });
+                                                                    setMigrationSelectedTypes({});
+                                                                    setMigrationSelectedGroups({});
+                                                                    setMigrationResults({ success: 0, failed: 0, items: [] });
+                                                                    setMigrationError('');
+                                                                }}
+                                                                className={`px-4 py-2 text-sm rounded-lg ${darkMode ? 'bg-gray-700 hover:bg-gray-600' : 'bg-gray-200 hover:bg-gray-300'} ${textClass}`}
+                                                            >
+                                                                <i className="fas fa-redo mr-2"></i>Start New Migration
+                                                            </button>
+                                                        </div>
+                                                    </div>
+                                                )}
+                                            </div>
+
+                                            {/* Migration Console Panel - Always Visible */}
+                                            <div className={`${cardClass} rounded-xl p-4 mt-4`}>
+                                                <div className={`flex items-center justify-between ${migrationConsoleMinimized ? '' : 'pb-2 mb-2 border-b'} ${darkMode ? 'border-gray-700' : 'border-gray-300'}`}>
+                                                    <div className="flex items-center flex-1 cursor-pointer" onClick={() => setMigrationConsoleMinimized(!migrationConsoleMinimized)}>
+                                                        <div className={`p-1.5 rounded-lg ${darkMode ? 'bg-gray-700' : 'bg-gray-200'} mr-2`}>
+                                                            <i className={`fas fa-terminal text-sm ${darkMode ? 'text-gray-400' : 'text-gray-600'}`}></i>
+                                                        </div>
+                                                        <h3 className={`text-base font-bold ${textClass}`}>Migration Console</h3>
+                                                        {migrationResults.items.length > 0 && (
+                                                            <span className={`ml-2 text-xs px-2 py-0.5 rounded ${darkMode ? 'bg-gray-700' : 'bg-gray-200'} ${textSecondaryClass}`}>
+                                                                {migrationResults.items.length} items
+                                                            </span>
+                                                        )}
+                                                    </div>
+                                                    <div className="flex items-center space-x-2">
+                                                        <button
+                                                            onClick={() => setMigrationConsoleMinimized(!migrationConsoleMinimized)}
+                                                            className={`p-1.5 rounded-lg ${darkMode ? 'hover:bg-gray-700 text-gray-400' : 'hover:bg-gray-200 text-gray-500'} transition-all`}
+                                                            title={migrationConsoleMinimized ? "Expand" : "Minimize"}
+                                                        >
+                                                            <i className={`fas fa-chevron-${migrationConsoleMinimized ? 'down' : 'up'}`}></i>
+                                                        </button>
+                                                        {!migrationConsoleMinimized && migrationResults.items.length > 0 && (
+                                                            <button
+                                                                onClick={() => setMigrationResults(prev => ({ ...prev, items: [] }))}
+                                                                className={`text-xs ${textSecondaryClass} hover:text-red-400`}
+                                                            >
+                                                                <i className="fas fa-trash mr-1"></i>Clear
+                                                            </button>
+                                                        )}
+                                                    </div>
+                                                </div>
+                                                {!migrationConsoleMinimized && (
+                                                    <div className={`${darkMode ? 'bg-black' : 'bg-gray-900'} rounded-lg p-2 max-h-48 overflow-y-auto font-mono text-xs flex flex-col-reverse`}>
+                                                        {migrationResults.items.length === 0 ? (
+                                                            <div className="text-gray-400 text-center py-6">
+                                                                <i className="fas fa-terminal text-2xl mb-2 block"></i>
+                                                                <p>No migration activity yet. Migration results will appear here.</p>
+                                                            </div>
+                                                        ) : (
+                                                            <div>
+                                                                {migrationResults.items.map((item, i) => (
+                                                                    <div key={i} className={item.status === 'error' ? 'text-red-400' : item.status === 'success' ? 'text-green-400' : 'text-gray-400'}>
+                                                                        <span className="text-gray-500">[{item.configType}]</span>{' '}
+                                                                        <span className={item.status === 'success' ? 'text-green-500' : 'text-red-500'}>{item.status === 'success' ? '✓' : '✗'}</span>{' '}
+                                                                        {item.name}{item.group ? ` (${item.group})` : ''}{item.error ? ` - ${item.error}` : ''}
+                                                                    </div>
+                                                                ))}
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                )}
+                                            </div>
+
+                                            {/* Migration curl Commands Panel - Always Visible */}
+                                            <div className={`${cardClass} rounded-xl p-4 mt-4`}>
+                                                <div className={`flex items-center justify-between ${migrationCurlMinimized ? '' : 'pb-2 mb-2 border-b'} ${darkMode ? 'border-gray-700' : 'border-gray-300'}`}>
+                                                    <div className="flex items-center flex-1 cursor-pointer" onClick={() => setMigrationCurlMinimized(!migrationCurlMinimized)}>
+                                                        <div className={`p-1.5 rounded-lg ${darkMode ? 'bg-gray-700' : 'bg-gray-200'} mr-2`}>
+                                                            <i className={`fas fa-code text-sm ${darkMode ? 'text-gray-400' : 'text-gray-600'}`}></i>
+                                                        </div>
+                                                        <h3 className={`text-base font-bold ${textClass}`}>curl Commands</h3>
+                                                    </div>
+                                                    <div className="flex items-center space-x-2">
+                                                        <button
+                                                            onClick={() => setMigrationCurlMinimized(!migrationCurlMinimized)}
+                                                            className={`p-1.5 rounded-lg ${darkMode ? 'hover:bg-gray-700 text-gray-400' : 'hover:bg-gray-200 text-gray-500'} transition-all`}
+                                                            title={migrationCurlMinimized ? "Expand" : "Minimize"}
+                                                        >
+                                                            <i className={`fas fa-chevron-${migrationCurlMinimized ? 'down' : 'up'}`}></i>
+                                                        </button>
+                                                        {!migrationCurlMinimized && (
+                                                            <>
+                                                                <button
+                                                                    onClick={() => setMigrationShowSensitive(!migrationShowSensitive)}
+                                                                    className="px-2 py-1 text-xs rounded-lg font-semibold bg-gray-700 hover:bg-gray-600 text-white transition-all"
+                                                                    title={migrationShowSensitive ? "Hide sensitive data" : "Show sensitive data"}
+                                                                >
+                                                                    <i className={`fas ${migrationShowSensitive ? 'fa-eye-slash' : 'fa-eye'} mr-1`}></i>
+                                                                    {migrationShowSensitive ? 'Hide' : 'Show'}
+                                                                </button>
+                                                                {migrationCommandHistory.length > 0 && (
+                                                                    <button
+                                                                        onClick={() => setMigrationCommandHistory([])}
+                                                                        className={`px-2 py-1 text-xs rounded-lg font-semibold ${darkMode ? 'bg-orange-700 hover:bg-orange-600' : 'bg-orange-500 hover:bg-orange-600'} text-white transition-all`}
+                                                                    >
+                                                                        <i className="fas fa-eraser mr-1"></i>Clear
+                                                                    </button>
+                                                                )}
+                                                            </>
+                                                        )}
+                                                    </div>
+                                                </div>
+
+                                                {!migrationCurlMinimized && (
+                                                    <div className={`${darkMode ? 'bg-black' : 'bg-gray-900'} rounded-lg p-3 font-mono text-[10px] max-h-64 overflow-y-auto flex flex-col-reverse`}>
+                                                        {migrationCommandHistory.length === 0 ? (
+                                                            <div className="text-gray-400 text-center py-6">
+                                                                <i className="fas fa-terminal text-2xl mb-2 block"></i>
+                                                                <p>No API commands yet. Commands will appear here as you perform migrations.</p>
+                                                            </div>
+                                                        ) : (
+                                                            <div className="space-y-3">
+                                                                {migrationCommandHistory.map((cmd) => (
+                                                                    <div key={cmd.id} className={`p-3 rounded-lg ${darkMode ? 'bg-gray-900' : 'bg-black'} border ${darkMode ? 'border-gray-700' : 'border-gray-600'}`}>
+                                                                        <div className="flex items-start justify-between mb-2">
+                                                                            <div className="flex-1">
+                                                                                <div className="flex items-center space-x-2 mb-1">
+                                                                                    <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${cmd.method === 'GET' ? 'bg-blue-600' : cmd.method === 'POST' ? 'bg-green-600' : cmd.method === 'DELETE' ? 'bg-red-600' : cmd.method === 'PATCH' ? 'bg-purple-600' : 'bg-orange-600'} text-white`}>
+                                                                                        {cmd.method}
+                                                                                    </span>
+                                                                                    <span className="text-gray-400 text-[10px]">{cmd.timestamp}</span>
+                                                                                </div>
+                                                                                <p className="text-green-400 text-[10px]">{cmd.description}</p>
+                                                                            </div>
+                                                                            <button
+                                                                                onClick={() => {
+                                                                                    navigator.clipboard.writeText(migrationShowSensitive ? cmd.curl : cmd.curl.replace(/Bearer [^"]+/, 'Bearer ***'));
+                                                                                    showMessage('Copied to clipboard!', 'success');
+                                                                                }}
+                                                                                className="ml-2 p-1.5 rounded-lg bg-gray-700 hover:bg-gray-600 text-white transition-all"
+                                                                                title="Copy curl command"
+                                                                            >
+                                                                                <i className="fas fa-copy text-[10px]"></i>
+                                                                            </button>
+                                                                        </div>
+                                                                        <pre className="text-gray-300 whitespace-pre-wrap break-all text-[10px] leading-relaxed">
+                                                                            {migrationShowSensitive ? cmd.curl : cmd.curl.replace(/Bearer [^"]+/, 'Bearer ***')}
+                                                                        </pre>
+                                                                    </div>
+                                                                ))}
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                )}
+                                            </div>
+                                        </div>
+                                    ) : selectedKnowledgeType === 'snapshots' ? (
+                                        /* Snapshots Interface */
+                                        <div className="grid gap-4 min-w-0">
+                                            <div className={`${cardClass} rounded-xl p-6 overflow-hidden`}>
+                                                <div className={`flex items-center justify-between pb-4 mb-4 border-b ${darkMode ? 'border-gray-700' : 'border-gray-300'}`}>
+                                                    <div className="flex items-center space-x-3">
+                                                        <div className={`p-2 rounded-lg ${darkMode ? 'bg-green-900' : 'bg-green-100'}`}>
+                                                            <i className={`fas fa-camera text-lg ${darkMode ? 'text-green-400' : 'text-green-600'}`}></i>
+                                                        </div>
+                                                        <div>
+                                                            <h3 className={`text-lg font-bold ${textClass}`}>Configuration Snapshots</h3>
+                                                            <p className={`text-xs ${textSecondaryClass}`}>Backup and restore POC configurations</p>
+                                                        </div>
+                                                    </div>
+                                                    <button
+                                                        onClick={() => showMessage('Create Snapshot feature coming soon!', 'info')}
+                                                        className="px-4 py-2 bg-green-600 hover:bg-green-700 text-white text-sm rounded-lg font-semibold transition-all flex items-center space-x-2"
+                                                    >
+                                                        <i className="fas fa-plus"></i>
+                                                        <span>Create Snapshot</span>
+                                                    </button>
+                                                </div>
+                                                <div className={`text-center py-12 ${textSecondaryClass}`}>
+                                                    <i className="fas fa-camera text-6xl mb-4 opacity-30"></i>
+                                                    <h4 className={`text-lg font-semibold mb-2 ${textClass}`}>No Snapshots Yet</h4>
+                                                    <p className="text-sm max-w-md mx-auto mb-6">
+                                                        Create a snapshot to backup your POC configurations.
+                                                        Snapshots include all knowledge objects, pipelines, routes, and settings.
+                                                    </p>
+                                                    <div className={`mt-4 p-4 rounded-lg ${darkMode ? 'bg-gray-800' : 'bg-gray-100'} max-w-lg mx-auto text-left`}>
+                                                        <p className={`text-sm font-semibold mb-2 ${textClass}`}>Snapshot features:</p>
+                                                        <ul className={`text-xs space-y-1 ${textSecondaryClass}`}>
+                                                            <li><i className="fas fa-check text-green-500 mr-2"></i>Full configuration backup</li>
+                                                            <li><i className="fas fa-check text-green-500 mr-2"></i>One-click restore</li>
+                                                            <li><i className="fas fa-check text-green-500 mr-2"></i>Export/Import snapshots</li>
+                                                            <li><i className="fas fa-check text-green-500 mr-2"></i>Version comparison</li>
+                                                            <li><i className="fas fa-check text-green-500 mr-2"></i>Selective restore</li>
+                                                        </ul>
+                                                    </div>
+                                                </div>
+                                            </div>
                                         </div>
                                     ) : (
                                         /* Knowledge Items Interface */

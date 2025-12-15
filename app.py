@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Cribl Knowledge Manager - Backend Server
-Version: 4.0.0
+Version: 5.0.0
 Date: December 2025
 
 This Flask application serves as a backend proxy for the Cribl Cloud API,
@@ -262,6 +262,12 @@ app_config = {
 
 # Database path for feed configurations
 MARKETPLACE_DB_PATH = Path('marketplace.db')
+
+# Database path for migration history (rollback feature)
+MIGRATION_HISTORY_DB_PATH = Path('migration_history.db')
+
+# Database path for snapshots (POC config backup/restore)
+SNAPSHOTS_DB_PATH = Path('snapshots.db')
 
 # Global scheduler instance
 scheduler = BackgroundScheduler()
@@ -1128,6 +1134,7 @@ def init_marketplace_db():
     cursor = conn.cursor()
 
     # Create feeds table with schedule_cron (full cron expression: minute hour day_of_month month day_of_week)
+    # targets column stores JSON: {"stream": ["group1", "group2"], "edge": ["fleet1"], "search": ["default_search"]}
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS feeds (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1136,9 +1143,9 @@ def init_marketplace_db():
             enabled INTEGER DEFAULT 0,
             lookup_filename TEXT NOT NULL,
             schedule_cron TEXT DEFAULT '0 6 * * *',
-            target_api_type TEXT DEFAULT 'stream',
-            target_worker_groups TEXT DEFAULT 'default',
+            targets TEXT DEFAULT '{}',
             auto_deploy INTEGER DEFAULT 0,
+            commit_message TEXT,
             auth_config TEXT,
             last_sync TEXT,
             last_sync_status TEXT,
@@ -1188,6 +1195,32 @@ def init_marketplace_db():
                 cursor.execute("UPDATE feeds SET schedule_cron = ? WHERE id = ?", (cron_expr, feed_id))
         debug_log("[MARKETPLACE] Migrated schedule schema from time to cron-based")
 
+    # Check if we need to migrate old target_api_type + target_worker_groups to new targets format
+    cursor.execute("PRAGMA table_info(feeds)")
+    columns = [col[1] for col in cursor.fetchall()]
+    if 'target_api_type' in columns and 'targets' not in columns:
+        # Add new targets column
+        cursor.execute("ALTER TABLE feeds ADD COLUMN targets TEXT DEFAULT '{}'")
+        # Migrate existing data from target_api_type + target_worker_groups to targets JSON
+        cursor.execute("SELECT id, target_api_type, target_worker_groups FROM feeds")
+        for row in cursor.fetchall():
+            feed_id, api_type, worker_groups = row
+            if api_type and worker_groups:
+                # Parse worker_groups (could be JSON array or plain string)
+                try:
+                    groups = json.loads(worker_groups) if worker_groups else []
+                except json.JSONDecodeError:
+                    groups = [worker_groups] if worker_groups else []
+                # Build new targets structure
+                targets = {}
+                if groups:
+                    if api_type == 'search':
+                        targets['search'] = ['default_search']
+                    else:
+                        targets[api_type] = groups
+                cursor.execute("UPDATE feeds SET targets = ? WHERE id = ?", (json.dumps(targets), feed_id))
+        debug_log("[MARKETPLACE] Migrated target schema from api_type+worker_groups to targets JSON")
+
     # Insert default feeds if table is empty
     cursor.execute("SELECT COUNT(*) FROM feeds")
     count = cursor.fetchone()[0]
@@ -1195,7 +1228,7 @@ def init_marketplace_db():
         debug_log("[MARKETPLACE] Inserting default feed configurations...")
         for feed in DEFAULT_FEEDS:
             cursor.execute('''
-                INSERT INTO feeds (provider_id, name, lookup_filename, schedule_cron, enabled, auto_deploy, target_worker_groups)
+                INSERT INTO feeds (provider_id, name, lookup_filename, schedule_cron, enabled, auto_deploy, targets)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             ''', (
                 feed['provider_id'],
@@ -1204,7 +1237,7 @@ def init_marketplace_db():
                 feed['schedule_cron'],
                 1 if feed.get('enabled', False) else 0,
                 1 if feed.get('auto_deploy', False) else 0,
-                ''  # Empty - user must configure target worker groups
+                '{}'  # Empty - user must configure targets
             ))
         debug_log(f"[MARKETPLACE] Inserted {len(DEFAULT_FEEDS)} default feeds")
 
@@ -1223,6 +1256,306 @@ def feed_row_to_dict(row):
     if row is None:
         return None
     return dict(row)
+
+# =============================================================================
+# MIGRATION HISTORY - Database Functions for Rollback Feature
+# =============================================================================
+
+def init_migration_history_db():
+    """Initialize the SQLite database for migration history tracking."""
+    conn = sqlite3.connect(MIGRATION_HISTORY_DB_PATH)
+    cursor = conn.cursor()
+
+    # Create migrations table - stores migration sessions
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS migrations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_org TEXT NOT NULL,
+            dest_org TEXT NOT NULL,
+            dest_client_id TEXT,
+            dest_client_secret_hash TEXT,
+            simulate_only INTEGER DEFAULT 0,
+            success_count INTEGER DEFAULT 0,
+            fail_count INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'completed',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    # Create migration_items table - stores individual items that were migrated
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS migration_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            migration_id INTEGER NOT NULL,
+            item_id TEXT NOT NULL,
+            item_type TEXT NOT NULL,
+            item_type_path TEXT NOT NULL,
+            product TEXT NOT NULL,
+            source_group TEXT NOT NULL,
+            dest_group TEXT NOT NULL,
+            status TEXT DEFAULT 'migrated',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (migration_id) REFERENCES migrations(id)
+        )
+    ''')
+
+    conn.commit()
+    conn.close()
+    debug_log("[MIGRATION_HISTORY] Database initialized")
+
+def get_migration_history_connection():
+    """Get a database connection for migration history."""
+    conn = sqlite3.connect(MIGRATION_HISTORY_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def save_migration_session(source_org, dest_org, dest_client_id, dest_client_secret, simulate_only, success_count, fail_count):
+    """Save a migration session and return its ID."""
+    import hashlib
+    # Hash the client secret for security (we only need it to identify the connection, not recover it)
+    secret_hash = hashlib.sha256(dest_client_secret.encode()).hexdigest()[:16] if dest_client_secret else None
+
+    conn = get_migration_history_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO migrations (source_org, dest_org, dest_client_id, dest_client_secret_hash, simulate_only, success_count, fail_count)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (source_org, dest_org, dest_client_id, secret_hash, 1 if simulate_only else 0, success_count, fail_count))
+    migration_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return migration_id
+
+def save_migration_item(migration_id, item_id, item_type, item_type_path, product, source_group, dest_group):
+    """Save a successfully migrated item."""
+    conn = get_migration_history_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO migration_items (migration_id, item_id, item_type, item_type_path, product, source_group, dest_group)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (migration_id, item_id, item_type, item_type_path, product, source_group, dest_group))
+    conn.commit()
+    conn.close()
+
+def get_migration_history(limit=50):
+    """Get recent migration history."""
+    conn = get_migration_history_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT m.*,
+               (SELECT COUNT(*) FROM migration_items WHERE migration_id = m.id) as item_count
+        FROM migrations m
+        ORDER BY m.created_at DESC
+        LIMIT ?
+    ''', (limit,))
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+def get_migration_items(migration_id):
+    """Get all items from a specific migration."""
+    conn = get_migration_history_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT * FROM migration_items WHERE migration_id = ? AND status = 'migrated'
+    ''', (migration_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+def mark_item_rolled_back(item_id):
+    """Mark a migration item as rolled back."""
+    conn = get_migration_history_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        UPDATE migration_items SET status = 'rolled_back' WHERE id = ?
+    ''', (item_id,))
+    conn.commit()
+    conn.close()
+
+def update_migration_status(migration_id, status):
+    """Update migration session status."""
+    conn = get_migration_history_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        UPDATE migrations SET status = ? WHERE id = ?
+    ''', (status, migration_id))
+    conn.commit()
+    conn.close()
+
+# =============================================================================
+# SNAPSHOTS - POC Configuration Backup/Restore System
+# =============================================================================
+
+def init_snapshots_db():
+    """Initialize the SQLite database for snapshots (POC config storage)."""
+    conn = sqlite3.connect(SNAPSHOTS_DB_PATH)
+    cursor = conn.cursor()
+
+    # Create snapshots table - stores snapshot metadata
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            description TEXT,
+            source_org_id TEXT NOT NULL,
+            source_org_name TEXT,
+            worker_group TEXT,
+            product TEXT DEFAULT 'stream',
+            product_version TEXT,
+            config_count INTEGER DEFAULT 0,
+            size_bytes INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    # Create snapshot_configs table - stores the actual config data
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS snapshot_configs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            snapshot_id INTEGER NOT NULL,
+            config_type TEXT NOT NULL,
+            config_data TEXT NOT NULL,
+            item_count INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (snapshot_id) REFERENCES snapshots(id) ON DELETE CASCADE
+        )
+    ''')
+
+    conn.commit()
+    conn.close()
+    debug_log("[SNAPSHOTS] Database initialized")
+
+def get_snapshots_connection():
+    """Get a database connection for snapshots."""
+    conn = sqlite3.connect(SNAPSHOTS_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def create_snapshot(name, description, source_org_id, source_org_name, worker_group, product, product_version, configs):
+    """
+    Create a new snapshot and store all configs.
+
+    Args:
+        name: User-provided name for the snapshot
+        description: Optional description
+        source_org_id: The source organization ID
+        source_org_name: Human-readable org name
+        worker_group: The worker group/fleet name
+        product: 'stream', 'edge', or 'search'
+        product_version: Version of the Cribl product
+        configs: Dict of {config_type: config_data}
+
+    Returns:
+        The created snapshot ID
+    """
+    import json
+
+    conn = get_snapshots_connection()
+    cursor = conn.cursor()
+
+    # Calculate totals
+    config_count = sum(len(v) if isinstance(v, list) else 1 for v in configs.values() if v)
+    size_bytes = len(json.dumps(configs))
+
+    # Insert snapshot metadata
+    cursor.execute('''
+        INSERT INTO snapshots (name, description, source_org_id, source_org_name, worker_group, product, product_version, config_count, size_bytes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (name, description, source_org_id, source_org_name, worker_group, product, product_version, config_count, size_bytes))
+
+    snapshot_id = cursor.lastrowid
+
+    # Insert each config type
+    for config_type, config_data in configs.items():
+        if config_data:
+            item_count = len(config_data) if isinstance(config_data, list) else 1
+            cursor.execute('''
+                INSERT INTO snapshot_configs (snapshot_id, config_type, config_data, item_count)
+                VALUES (?, ?, ?, ?)
+            ''', (snapshot_id, config_type, json.dumps(config_data), item_count))
+
+    conn.commit()
+    conn.close()
+    debug_log(f"[SNAPSHOTS] Created snapshot {snapshot_id}: {name} with {config_count} configs")
+    return snapshot_id
+
+def list_snapshots():
+    """Get all snapshots with metadata."""
+    conn = get_snapshots_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT s.*,
+               (SELECT GROUP_CONCAT(DISTINCT config_type) FROM snapshot_configs WHERE snapshot_id = s.id) as config_types
+        FROM snapshots s
+        ORDER BY s.created_at DESC
+    ''')
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+def get_snapshot(snapshot_id):
+    """Get a specific snapshot with all its configs."""
+    import json
+
+    conn = get_snapshots_connection()
+    cursor = conn.cursor()
+
+    # Get snapshot metadata
+    cursor.execute('SELECT * FROM snapshots WHERE id = ?', (snapshot_id,))
+    snapshot = cursor.fetchone()
+    if not snapshot:
+        conn.close()
+        return None
+
+    snapshot_dict = dict(snapshot)
+
+    # Get all configs for this snapshot
+    cursor.execute('SELECT config_type, config_data, item_count FROM snapshot_configs WHERE snapshot_id = ?', (snapshot_id,))
+    configs = cursor.fetchall()
+
+    snapshot_dict['configs'] = {}
+    for row in configs:
+        snapshot_dict['configs'][row['config_type']] = json.loads(row['config_data'])
+
+    conn.close()
+    return snapshot_dict
+
+def delete_snapshot(snapshot_id):
+    """Delete a snapshot and all its configs."""
+    conn = get_snapshots_connection()
+    cursor = conn.cursor()
+
+    # Delete configs first (cascade should handle this but be explicit)
+    cursor.execute('DELETE FROM snapshot_configs WHERE snapshot_id = ?', (snapshot_id,))
+    cursor.execute('DELETE FROM snapshots WHERE id = ?', (snapshot_id,))
+
+    affected = cursor.rowcount
+    conn.commit()
+    conn.close()
+    debug_log(f"[SNAPSHOTS] Deleted snapshot {snapshot_id}")
+    return affected > 0
+
+def update_snapshot(snapshot_id, name=None, description=None):
+    """Update snapshot metadata."""
+    conn = get_snapshots_connection()
+    cursor = conn.cursor()
+
+    updates = []
+    values = []
+    if name is not None:
+        updates.append('name = ?')
+        values.append(name)
+    if description is not None:
+        updates.append('description = ?')
+        values.append(description)
+
+    if updates:
+        values.append(snapshot_id)
+        cursor.execute(f'UPDATE snapshots SET {", ".join(updates)} WHERE id = ?', values)
+        conn.commit()
+
+    conn.close()
 
 # =============================================================================
 # MARKETPLACE - Feed Download and Parsing Functions
@@ -1704,49 +2037,64 @@ def execute_feed_sync(feed_id, manual=False):
 
         conn.commit()
 
-        # Track transfer result for response
-        transfer_result = None
-        transfer_message = None
+        # Track transfer results for response
+        all_transfers = []
+        transfer_messages = []
 
-        # If authenticated with Cribl, transfer the lookup to target worker groups
-        if app_config['authenticated'] and feed['target_worker_groups']:
-            # Handle target_worker_groups as either JSON array or plain string
-            target_groups_raw = feed['target_worker_groups']
-            try:
-                target_groups = json.loads(target_groups_raw) if target_groups_raw else []
-            except json.JSONDecodeError:
-                # If not valid JSON, treat as plain string (single group name)
-                target_groups = [target_groups_raw] if target_groups_raw else []
+        # Parse targets JSON - supports multi-product format: {"stream": [...], "edge": [...], "search": [...]}
+        targets_raw = feed.get('targets', '{}')
+        try:
+            targets = json.loads(targets_raw) if targets_raw else {}
+        except json.JSONDecodeError:
+            targets = {}
 
-            # Filter out empty values only (don't filter 'default' as it's a valid Cribl group name)
-            target_groups = [g for g in target_groups if g]
+        has_targets = any(targets.get(t) for t in ['stream', 'edge', 'search'])
 
-            if target_groups:
-                debug_log(f"[MARKETPLACE] Transferring lookup to groups: {target_groups}")
+        # If authenticated with Cribl, transfer the lookup to all target products
+        if app_config['authenticated'] and has_targets:
+            for api_type in ['stream', 'edge', 'search']:
+                target_groups = targets.get(api_type, [])
+                if not target_groups:
+                    continue
+
+                # Filter out empty values
+                target_groups = [g for g in target_groups if g]
+                if not target_groups:
+                    continue
+
+                debug_log(f"[MARKETPLACE] Transferring lookup to {api_type}: {target_groups}")
                 transfer_result = transfer_feed_to_cribl(
                     feed,
                     csv_content,
                     target_groups,
+                    api_type=api_type,
                     auto_deploy=feed['auto_deploy']
                 )
+
+                all_transfers.extend(transfer_result.get('transfers', []))
+
                 if transfer_result['success']:
                     successful = [t['group'] for t in transfer_result['transfers'] if t.get('status') == 'success']
                     if successful:
-                        transfer_message = f"Transferred to: {', '.join(successful)}"
-                        if feed['auto_deploy']:
-                            transfer_message += " (deployed)"
-                        debug_log(f"[MARKETPLACE] {transfer_message}")
+                        msg = f"{api_type.capitalize()}: {', '.join(successful)}"
+                        transfer_messages.append(msg)
+                        debug_log(f"[MARKETPLACE] {msg}")
                 else:
-                    transfer_message = f"Transfer failed: {transfer_result['error']}"
-                    debug_log(f"[MARKETPLACE] {transfer_message}")
+                    msg = f"{api_type.capitalize()} failed: {transfer_result['error']}"
+                    transfer_messages.append(msg)
+                    debug_log(f"[MARKETPLACE] {msg}")
+
+            if transfer_messages:
+                transfer_message = "Transferred to " + "; ".join(transfer_messages)
+                if feed['auto_deploy']:
+                    transfer_message += " (deployed)"
             else:
-                transfer_message = "No target worker groups configured (edit feed to set destination)"
-                debug_log(f"[MARKETPLACE] {transfer_message}")
+                transfer_message = "No successful transfers"
         elif not app_config['authenticated']:
             transfer_message = "Not authenticated with Cribl - login to enable transfer"
             debug_log(f"[MARKETPLACE] {transfer_message}")
         else:
-            transfer_message = "No target worker groups configured"
+            transfer_message = "No targets configured (edit feed to set destination)"
             debug_log(f"[MARKETPLACE] {transfer_message}")
 
         # Build final message with transfer status
@@ -1779,7 +2127,7 @@ def update_feed_status(feed_id, status, message):
     conn.commit()
     conn.close()
 
-def transfer_feed_to_cribl(feed, csv_content, target_groups, auto_deploy=False):
+def transfer_feed_to_cribl(feed, csv_content, target_groups, api_type='stream', auto_deploy=False):
     """
     Transfer feed lookup to Cribl worker groups.
     Uses the same API pattern as the working transfer_lookup function.
@@ -1788,11 +2136,11 @@ def transfer_feed_to_cribl(feed, csv_content, target_groups, auto_deploy=False):
         feed: Feed configuration dict
         csv_content: CSV content string
         target_groups: List of worker group names
+        api_type: API type ('stream', 'edge', or 'search')
         auto_deploy: Whether to auto-deploy after transfer
     """
     results = {'success': True, 'transfers': [], 'error': None}
 
-    api_type = feed.get('target_api_type', 'stream')
     filename = feed['lookup_filename']
     token = app_config['token']
 
@@ -1858,10 +2206,11 @@ def transfer_feed_to_cribl(feed, csv_content, target_groups, auto_deploy=False):
 
             # Step 3: Commit changes
             commit_url = build_api_url(api_type, group, path='/version/commit')
+            commit_msg = feed.get('commit_message') or f"Update {feed['name']} from Marketplace Feed"
             commit_response = requests.post(
                 commit_url,
                 headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-                json={"message": f"[Marketplace] Updated {filename} from {feed['name']}"},
+                json={"message": commit_msg},
                 timeout=30
             )
 
@@ -2348,17 +2697,64 @@ def discover_pack_lookups():
 
 @app.route('/api/config', methods=['GET'])
 def get_config():
-    """Check if config file exists and return non-sensitive config data."""
+    """Check if config file exists and return config data.
+
+    If 'full=true' query param is provided, returns all credentials (for Migration feature).
+    Otherwise returns only organization_id for security.
+    """
+    config, source = load_config_file()
+    if config and all(config.values()):
+        # Check if full credentials requested (for Migration feature)
+        include_full = request.args.get('full', 'false').lower() == 'true'
+
+        if include_full:
+            return jsonify({
+                'hasConfig': True,
+                'configSource': source,
+                'client_id': config['client_id'],
+                'client_secret': config['client_secret'],
+                'organization_id': config['organization_id']
+            })
+        else:
+            return jsonify({
+                'hasConfig': True,
+                'configSource': source,  # 'env' or 'file'
+                'config': {
+                    'organization_id': config['organization_id']
+                }
+            })
+    return jsonify({'hasConfig': False})
+
+@app.route('/api/credentials', methods=['GET'])
+def get_credentials():
+    """Get stored credentials for authenticated sessions (used by Migration feature)."""
+    if not app_config['authenticated']:
+        return jsonify({'error': 'Not authenticated'}), 401
+
+    # First check if credentials are in app_config (from interactive login)
+    if (app_config.get('client_id') and app_config.get('client_secret') and
+        app_config.get('organization_id')):
+        return jsonify({
+            'success': True,
+            'credentials': {
+                'client_id': app_config['client_id'],
+                'client_secret': app_config['client_secret'],
+                'organization_id': app_config['organization_id']
+            }
+        })
+
+    # Fall back to config file/env vars
     config, source = load_config_file()
     if config and all(config.values()):
         return jsonify({
-            'hasConfig': True,
-            'configSource': source,  # 'env' or 'file'
-            'config': {
+            'success': True,
+            'credentials': {
+                'client_id': config['client_id'],
+                'client_secret': config['client_secret'],
                 'organization_id': config['organization_id']
             }
         })
-    return jsonify({'hasConfig': False})
+    return jsonify({'success': False, 'error': 'No stored credentials available'})
 
 @app.route('/api/session-info', methods=['GET'])
 def get_session_info():
@@ -4371,12 +4767,102 @@ def transfer_lookup():
             # Cribl stores lookups in groups/{group}/data/lookups/
             lookup_csv_path = f"groups/{target_group}/data/lookups/{target_filename}"
             lookup_yml_path = f"groups/{target_group}/data/lookups/{Path(target_filename).stem}.yml"
-            
+            lookup_gitignore_path = f"groups/{target_group}/data/lookups/.gitignore"
+            lookup_base = Path(target_filename).stem
+
+            # For disk-based lookups, we need to fetch actual pending files
+            # because Cribl automatically updates .gitignore when creating disk lookups
+            if lookup_type == 'file':  # disk-based
+                debug_log(f"   [INFO] Disk lookup: waiting for Cribl to update .gitignore...")
+
+                commit_headers = {
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json"
+                }
+                status_url = build_api_url(target_api_type, target_group, path='/version/status')
+
+                # Poll for .gitignore to appear in pending files
+                # Cribl modifies .gitignore asynchronously when disk lookups are created
+                max_attempts = 10
+                poll_interval = 0.5  # 500ms between polls
+                gitignore_found_in_pending = False
+                pending_files = []
+
+                for attempt in range(max_attempts):
+                    time.sleep(poll_interval)
+                    debug_log(f"   [INFO] Polling for .gitignore (attempt {attempt + 1}/{max_attempts})...")
+
+                    try:
+                        status_response = requests.get(status_url, headers=commit_headers, timeout=10)
+                        status_response.raise_for_status()
+                        status_data = status_response.json()
+
+                        # Extract pending files from response
+                        pending_files = []
+                        if 'items' in status_data and isinstance(status_data['items'], list):
+                            for item in status_data['items']:
+                                if isinstance(item, dict) and 'file' in item:
+                                    pending_files.append(item['file'])
+                                elif isinstance(item, str):
+                                    pending_files.append(item)
+                        elif 'files' in status_data and isinstance(status_data['files'], list):
+                            pending_files = status_data['files']
+
+                        debug_log(f"   [INFO] Found {len(pending_files)} pending files: {pending_files}")
+
+                        # Check if .gitignore is in pending files
+                        for f in pending_files:
+                            if '.gitignore' in f and 'lookups' in f:
+                                gitignore_found_in_pending = True
+                                debug_log(f"   [OK] Found .gitignore in pending files: {f}")
+                                break
+
+                        if gitignore_found_in_pending:
+                            break
+
+                    except Exception as poll_error:
+                        debug_log(f"   [WARNING] Poll error: {poll_error}")
+                        continue
+
+                if not gitignore_found_in_pending:
+                    debug_log(f"   [WARNING] .gitignore not found in pending files after {max_attempts} attempts")
+                    debug_log(f"   [WARNING] Proceeding with commit anyway - .gitignore may need manual commit")
+
+                # Filter to files related to this lookup (YML, gitignore)
+                # For disk lookups: we want YML and .gitignore, NOT the CSV
+                files_to_commit = []
+                for f in pending_files:
+                    # Include the YML file for this lookup
+                    if lookup_base in f and f.endswith('.yml'):
+                        files_to_commit.append(f)
+                    # Include .gitignore (which tracks excluded disk lookup CSVs)
+                    elif '.gitignore' in f and 'lookups' in f:
+                        files_to_commit.append(f)
+
+                debug_log(f"   [INFO] Disk lookup files to commit: {files_to_commit}")
+
+                # Always ensure .gitignore is included for disk lookups if found in pending
+                gitignore_in_commit = any('.gitignore' in f for f in files_to_commit)
+                if not gitignore_in_commit and gitignore_found_in_pending:
+                    debug_log(f"   [INFO] Adding .gitignore path explicitly: {lookup_gitignore_path}")
+                    files_to_commit.append(lookup_gitignore_path)
+
+                # Ensure YML is included
+                yml_found = any(f.endswith('.yml') and lookup_base in f for f in files_to_commit)
+                if not yml_found:
+                    debug_log(f"   [INFO] Adding YML path explicitly: {lookup_yml_path}")
+                    files_to_commit.append(lookup_yml_path)
+
+                debug_log(f"   [INFO] Disk lookup: committing {len(files_to_commit)} files (CSV excluded from git)")
+            else:  # memory-based
+                files_to_commit = [lookup_csv_path, lookup_yml_path]
+                debug_log(f"   [INFO] Memory lookup: committing CSV and YML")
+
             commit_url = build_api_url(target_api_type, target_group, path='/version/commit')
             commit_payload = {
                 "message": f"{COMMIT_PREFIX} Transfer lookup: {target_filename}",
                 "group": target_group,
-                "files": [lookup_csv_path, lookup_yml_path]
+                "files": files_to_commit
             }
             
             commit_headers = {
@@ -4645,10 +5131,27 @@ def deploy_changes():
     
     if not worker_group:
         return jsonify({'error': 'Worker group required'}), 400
-    
+
+    # Search doesn't use the commit/deploy workflow - changes are applied immediately on commit
+    if api_type == 'search':
+        debug_log(f"\n[DEPLOY] Search doesn't require deploy - changes applied on commit")
+
+        # Clear any stored commit for Search
+        commit_key = f"{worker_group}:{api_type}"
+        transfer_commits = app_config.get('transfer_commits', {})
+        if commit_key in transfer_commits:
+            del transfer_commits[commit_key]
+
+        return jsonify({
+            'success': True,
+            'message': f'Search changes applied immediately (no deploy needed)',
+            'skipped': True,
+            'reason': 'Search applies changes on commit'
+        })
+
     token = app_config['token']
     base_url = get_base_url()  # Use helper function
-    
+
     debug_log(f"\n[DEPLOY] Deploying to {worker_group}...")
 
     # Look up commit ID from transfer_commits dict (supports bulk transfers)
@@ -4902,17 +5405,62 @@ def delete_lookup(worker_group, lookup_filename):
             except requests.exceptions.HTTPError as commit_error:
                 # Partial commit with deleted files failed (likely 500 error)
                 debug_log(f"   [ERROR] Partial commit failed: {commit_error.response.status_code}")
-                debug_log(f"   [ERROR] This is expected - Cribl API may not support partial commit of deleted files")
-                debug_log(f"   [WARNING] Deletion succeeded but NOT committed to prevent committing other changes")
-                debug_log(f"   [WARNING] Please commit manually in Cribl UI to complete the deletion")
-                
-                return jsonify({
-                    'success': True,
-                    'message': f'Successfully deleted {lookup_filename} but could not do partial commit',
-                    'committed': False,
-                    'warning': 'Cribl API does not support partial commit of deleted files. Please commit manually in Cribl UI to avoid committing other pending changes.',
-                    'manual_commit_required': True
-                })
+                debug_log(f"   [INFO] Falling back to full commit...")
+
+                # Try full commit instead (commit all pending changes)
+                try:
+                    full_commit_data = {
+                        "message": commit_message,
+                        "group": worker_group
+                        # No "files" parameter = commit all pending changes
+                    }
+
+                    full_commit_response = requests.post(commit_url, json=full_commit_data, headers=headers, timeout=30)
+                    full_commit_response.raise_for_status()
+                    full_commit_result = full_commit_response.json()
+
+                    debug_log(f"   [DATA] Full commit response: {json.dumps(full_commit_result, indent=2)}")
+
+                    # Extract commit ID from response
+                    commit_id = None
+                    if 'items' in full_commit_result and isinstance(full_commit_result['items'], list) and len(full_commit_result['items']) > 0:
+                        first_item = full_commit_result['items'][0]
+                        commit_id = (first_item.get('commit') or
+                                    first_item.get('hash') or
+                                    first_item.get('version'))
+
+                    if not commit_id:
+                        commit_id = full_commit_result.get('commit') or full_commit_result.get('hash') or full_commit_result.get('version', 'unknown')
+
+                    debug_log(f"   [OK] Full commit successful: {str(commit_id)[:8]}...")
+
+                    # Store commit ID for deployment
+                    app_config['last_transfer_commit_id'] = commit_id
+                    app_config['last_transfer_group'] = worker_group
+                    app_config['last_transfer_api_type'] = api_type
+                    app_config['last_transfer_files'] = deletion_files
+
+                    return jsonify({
+                        'success': True,
+                        'message': f'Successfully deleted {lookup_filename}',
+                        'committed': True,
+                        'commit_id': commit_id,
+                        'partial_commit': False,
+                        'full_commit': True
+                    })
+
+                except Exception as full_commit_error:
+                    debug_log(f"   [ERROR] Full commit also failed: {str(full_commit_error)}")
+                    debug_log(f"   [WARNING] Deletion succeeded but NOT committed")
+                    debug_log(f"   [WARNING] Please commit manually in Cribl UI to complete the deletion")
+
+                    return jsonify({
+                        'success': True,
+                        'message': f'Successfully deleted {lookup_filename} but could not commit',
+                        'committed': False,
+                        'warning': 'Could not commit deletion. Please commit manually in Cribl UI.',
+                        'manual_commit_required': True
+                    })
                 
         except Exception as status_error:
             debug_log(f"   [ERROR] Could not get pending changes: {str(status_error)}")
@@ -5288,11 +5836,15 @@ def create_feed():
     cursor = conn.cursor()
 
     try:
+        # Handle targets - could be string or dict
+        targets = data.get('targets', '{}')
+        if isinstance(targets, dict):
+            targets = json.dumps(targets)
+
         cursor.execute('''
             INSERT INTO feeds (
                 provider_id, name, enabled, lookup_filename,
-                schedule_cron, target_api_type,
-                target_worker_groups, auto_deploy, auth_config
+                schedule_cron, targets, auto_deploy, commit_message, auth_config
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             provider_id,
@@ -5300,9 +5852,9 @@ def create_feed():
             1 if data.get('enabled', True) else 0,
             data.get('lookup_filename', provider['default_filename']),
             data.get('schedule_cron', '0 6 * * *'),
-            data.get('target_api_type', 'stream'),
-            data.get('target_worker_group', 'default'),
+            targets,
             1 if data.get('auto_deploy', False) else 0,
+            data.get('commit_message', f"Update {data.get('name', provider['name'])} from Marketplace Feed"),
             json.dumps(data.get('auth_config', {}))
         ))
 
@@ -5354,15 +5906,22 @@ def update_feed(feed_id):
         return jsonify({'error': 'Feed not found'}), 404
 
     try:
+        # Handle targets - could be string or dict
+        targets = data.get('targets')
+        if targets is None:
+            targets = existing['targets'] or '{}'
+        elif isinstance(targets, dict):
+            targets = json.dumps(targets)
+
         cursor.execute('''
             UPDATE feeds SET
                 name = ?,
                 enabled = ?,
                 lookup_filename = ?,
                 schedule_cron = ?,
-                target_api_type = ?,
-                target_worker_groups = ?,
+                targets = ?,
                 auto_deploy = ?,
+                commit_message = ?,
                 auth_config = ?,
                 updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
@@ -5371,9 +5930,9 @@ def update_feed(feed_id):
             1 if data.get('enabled', existing['enabled']) else 0,
             data.get('lookup_filename', existing['lookup_filename']),
             data.get('schedule_cron', existing['schedule_cron'] or '0 6 * * *'),
-            data.get('target_api_type', existing['target_api_type']),
-            data.get('target_worker_groups', existing['target_worker_groups'] or 'default'),
+            targets,
             1 if data.get('auto_deploy', existing['auto_deploy']) else 0,
+            data.get('commit_message', existing['commit_message'] or f"Update {data.get('name', existing['name'])} from Marketplace Feed"),
             json.dumps(data.get('auth_config', json.loads(existing['auth_config'] or '{}'))),
             feed_id
         ))
@@ -5512,6 +6071,113 @@ def test_provider():
         'message': f'Successfully downloaded and parsed {record_count} records'
     })
 
+@app.route('/api/marketplace/test-feed', methods=['POST'])
+def test_feed():
+    """Test a full feed sync with given configuration (without saving to database)."""
+    data = request.json
+    provider_id = data.get('provider_id')
+    auth_config = data.get('auth_config', {})
+    lookup_filename = data.get('lookup_filename', 'test_feed.csv')
+    auto_deploy = data.get('auto_deploy', True)
+
+    # Parse targets - could be new multi-product format or legacy format
+    targets_raw = data.get('targets', {})
+    if isinstance(targets_raw, str):
+        try:
+            targets = json.loads(targets_raw)
+        except json.JSONDecodeError:
+            targets = {}
+    else:
+        targets = targets_raw
+
+    if provider_id not in FEED_PROVIDERS:
+        return jsonify({'error': f'Unknown provider: {provider_id}'}), 400
+
+    # Download feed content
+    content, error = download_feed_content(provider_id, auth_config)
+    if error:
+        return jsonify({'success': False, 'error': f"Download failed: {error}"})
+
+    # Parse to CSV
+    csv_content, record_count, parse_error = parse_feed_to_csv(provider_id, content)
+    if parse_error:
+        return jsonify({'success': False, 'error': f"Parse failed: {parse_error}"})
+
+    # Build feed-like dict for transfer
+    feed = {
+        'name': 'Test Feed',
+        'lookup_filename': lookup_filename,
+        'auto_deploy': auto_deploy
+    }
+
+    # If not authenticated with Cribl, just return parse success
+    if not app_config['authenticated']:
+        return jsonify({
+            'success': True,
+            'message': f'Downloaded and parsed {record_count} records. Login to Cribl to test transfer.',
+            'record_count': record_count,
+            'transfer_message': 'Not authenticated with Cribl - login to enable transfer'
+        })
+
+    # Check if any targets are specified
+    has_targets = any(targets.get(t) for t in ['stream', 'edge', 'search'])
+    if not has_targets:
+        return jsonify({
+            'success': True,
+            'message': f'Downloaded and parsed {record_count} records. No targets specified.',
+            'record_count': record_count,
+            'transfer_message': 'No targets specified'
+        })
+
+    # Transfer to all target products
+    all_transfers = []
+    transfer_messages = []
+
+    for api_type in ['stream', 'edge', 'search']:
+        target_groups = targets.get(api_type, [])
+        if not target_groups:
+            continue
+
+        # Filter out empty values
+        target_groups = [g for g in target_groups if g]
+        if not target_groups:
+            continue
+
+        transfer_result = transfer_feed_to_cribl(
+            feed,
+            csv_content,
+            target_groups,
+            api_type=api_type,
+            auto_deploy=auto_deploy
+        )
+
+        all_transfers.extend(transfer_result.get('transfers', []))
+
+        if transfer_result['success']:
+            successful = [t['group'] for t in transfer_result['transfers'] if t.get('status') == 'success']
+            if successful:
+                msg = f"{api_type.capitalize()}: {', '.join(successful)}"
+                transfer_messages.append(msg)
+        else:
+            msg = f"{api_type.capitalize()} failed: {transfer_result.get('error', 'Unknown error')}"
+            transfer_messages.append(msg)
+
+    if transfer_messages:
+        transfer_message = "Transferred to " + "; ".join(transfer_messages)
+        if auto_deploy:
+            transfer_message += " (deployed)"
+    else:
+        transfer_message = "No successful transfers"
+
+    return jsonify({
+        'success': True,
+        'message': f'Synced {record_count} records. {transfer_message}',
+        'record_count': record_count,
+        'transfer_message': transfer_message,
+        'transfers': all_transfers,
+        'csv_content': csv_content
+    })
+
 @app.route('/api/marketplace/scheduler/status', methods=['GET'])
 def get_scheduler_status():
     """Get scheduler status and scheduled jobs."""
@@ -5584,6 +6250,1231 @@ def get_available_port(preferred_port=42002):
             sys.exit(0)
 
 # =============================================================================
+# ORG-TO-ORG MIGRATION ENDPOINTS
+# =============================================================================
+
+def get_token_for_org(client_id, client_secret):
+    """Get OAuth token for a specific org using provided credentials."""
+    url = "https://login.cribl.cloud/oauth/token"
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "grant_type": "client_credentials",
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "audience": "https://api.cribl.cloud"
+    }
+    response = requests.post(url, headers=headers, json=payload, timeout=10)
+    response.raise_for_status()
+    return response.json()["access_token"]
+
+def normalize_org_id(org_id):
+    """Normalize org ID to extract just the org identifier."""
+    if not org_id:
+        return None
+    org_id = org_id.strip()
+    if org_id.startswith('https://'):
+        org_id = org_id.replace('https://', '')
+    if org_id.startswith('http://'):
+        org_id = org_id.replace('http://', '')
+    if org_id.endswith('/'):
+        org_id = org_id[:-1]
+    if '.cribl.cloud' in org_id:
+        org_id = org_id.split('.cribl.cloud')[0]
+    return org_id
+
+def get_base_url_for_org(org_id):
+    """Get the base URL for a specific org."""
+    normalized = normalize_org_id(org_id)
+    return f"https://{normalized}.cribl.cloud"
+
+def get_workspaces_for_org(client_id, client_secret, org_id):
+    """Get the list of workspaces for an organization using the Management Plane API."""
+    try:
+        # Get token
+        token = get_token_for_org(client_id, client_secret)
+
+        # Extract the actual org ID without workspace prefix for the management API
+        # org_id might be like "main-your-org" or "your-org"
+        # The management API needs the org ID without workspace prefix
+        normalized_org = normalize_org_id(org_id)
+
+        # Management Plane API uses gateway.cribl.cloud
+        mgmt_url = f"https://gateway.cribl.cloud/v1/organizations/{normalized_org}/workspaces"
+        headers = {"Authorization": f"Bearer {token}"}
+
+        debug_log(f"[WORKSPACES] Fetching workspaces from: {mgmt_url}")
+        response = requests.get(mgmt_url, headers=headers, timeout=10)
+
+        if response.ok:
+            data = response.json()
+            debug_log(f"[WORKSPACES] Response: {data}")
+            # Extract workspace IDs
+            if isinstance(data, list):
+                return [w.get('id') or w.get('name') for w in data if w.get('id') or w.get('name')]
+            elif isinstance(data, dict) and 'items' in data:
+                return [w.get('id') or w.get('name') for w in data['items'] if w.get('id') or w.get('name')]
+            return ['main']  # Default fallback
+        else:
+            debug_log(f"[WORKSPACES] Failed to get workspaces: {response.status_code} - {response.text}")
+            return ['main']  # Default fallback
+    except Exception as e:
+        debug_log(f"[WORKSPACES] Error getting workspaces: {e}")
+        return ['main']  # Default fallback
+
+@app.route('/api/org-migration/workspaces', methods=['POST'])
+def get_org_workspaces():
+    """Get the list of workspaces for an organization."""
+    data = request.get_json()
+    client_id = data.get('clientId')
+    client_secret = data.get('clientSecret')
+    org_id = data.get('orgId')
+
+    if not all([client_id, client_secret, org_id]):
+        return jsonify({'success': False, 'error': 'Missing required credentials'}), 400
+
+    try:
+        workspaces = get_workspaces_for_org(client_id, client_secret, org_id)
+        return jsonify({
+            'success': True,
+            'workspaces': workspaces
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+
+@app.route('/api/org-migration/test-connection', methods=['POST'])
+def test_org_connection():
+    """Test connection to an org with provided credentials."""
+    data = request.get_json()
+    client_id = data.get('clientId')
+    client_secret = data.get('clientSecret')
+    org_id = data.get('orgId')
+    workspace = data.get('workspace', 'main')  # Default to 'main' workspace
+
+    if not all([client_id, client_secret, org_id]):
+        return jsonify({'success': False, 'error': 'Missing required credentials'}), 400
+
+    try:
+        # Get token
+        token = get_token_for_org(client_id, client_secret)
+        base_url = get_base_url_for_org(org_id)
+        headers = {"Authorization": f"Bearer {token}"}
+
+        # Get workspaces
+        workspaces = get_workspaces_for_org(client_id, client_secret, org_id)
+
+        # Get Stream worker groups
+        stream_groups = []
+        try:
+            stream_url = f"{base_url}/api/v1/master/groups"
+            response = requests.get(stream_url, headers=headers, timeout=10)
+            if response.ok:
+                stream_data = response.json()
+                if 'items' in stream_data:
+                    stream_groups = [g.get('id') for g in stream_data['items']]
+        except Exception as e:
+            debug_log(f"[ORG MIGRATION] Failed to get stream groups: {e}")
+
+        # Get Edge fleets
+        edge_fleets = []
+        try:
+            edge_url = f"{base_url}/api/v1/products/edge/groups"
+            response = requests.get(edge_url, headers=headers, timeout=10)
+            if response.ok:
+                edge_data = response.json()
+                if 'items' in edge_data:
+                    edge_fleets = [g.get('id') for g in edge_data['items']]
+        except Exception as e:
+            debug_log(f"[ORG MIGRATION] Failed to get edge fleets: {e}")
+
+        # Filter stream_groups to exclude edge_fleets (the master/groups API returns all groups)
+        # Also exclude common Search group names
+        search_group_names = {'default_search', 'search'}
+        edge_fleets_set = set(edge_fleets)
+        stream_groups = [g for g in stream_groups if g not in edge_fleets_set and g not in search_group_names]
+
+        return jsonify({
+            'success': True,
+            'stream_groups': stream_groups,
+            'edge_fleets': edge_fleets,
+            'workspaces': workspaces
+        })
+
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 400
+
+@app.route('/api/org-migration/migrate', methods=['POST'])
+def migrate_org():
+    """Perform full org-to-org migration with SSE progress updates."""
+    data = request.get_json()
+    source = data.get('source', {})
+    destination = data.get('destination', {})
+    selected_types = data.get('selectedTypes', {})  # Dict of type_id -> boolean
+    selected_groups = data.get('selectedGroups', {})  # Dict of group_id -> boolean
+    group_map = data.get('groupMap', {})  # Dict of source_group -> dest_group
+    simulate_only = data.get('simulateOnly', False)  # Dry run mode
+
+    def generate():
+        success_count = 0
+        fail_count = 0
+        migrated_items = []  # Track successfully migrated items for rollback
+
+        def emit_curl_command(method, url, description, target='source', body=None):
+            """Emit a curl_command SSE event for the frontend curl Commands panel."""
+            event = {
+                'type': 'curl_command',
+                'method': method,
+                'url': url,
+                'description': description,
+                'target': target,
+                'body': body
+            }
+            return f"data: {json.dumps(event)}\n\n"
+
+        try:
+            # Authenticate with both orgs
+            yield f"data: {json.dumps({'type': 'progress', 'phase': 'Authenticating with source org...', 'current': 0, 'total': 0})}\n\n"
+            source_token = get_token_for_org(source['clientId'], source['clientSecret'])
+            source_base_url = get_base_url_for_org(source['orgId'])
+            source_headers = {"Authorization": f"Bearer {source_token}"}
+
+            yield f"data: {json.dumps({'type': 'progress', 'phase': 'Authenticating with destination org...', 'current': 0, 'total': 0})}\n\n"
+            dest_token = get_token_for_org(destination['clientId'], destination['clientSecret'])
+            dest_base_url = get_base_url_for_org(destination['orgId'])
+            dest_headers = {"Authorization": f"Bearer {dest_token}", "Content-Type": "application/json"}
+
+            # Parse selected_groups which have keys like 'stream:groupName' or 'edge:fleetName'
+            # Extract plain group names and track their types
+            selected_stream_groups = set()
+            selected_edge_fleets = set()
+            for key, enabled in selected_groups.items():
+                if enabled:
+                    if key.startswith('stream:'):
+                        selected_stream_groups.add(key[7:])  # Strip 'stream:' prefix
+                    elif key.startswith('edge:'):
+                        selected_edge_fleets.add(key[5:])  # Strip 'edge:' prefix
+                    else:
+                        # Fallback: assume it's a stream group
+                        selected_stream_groups.add(key)
+
+            # Log mode indicator
+            mode_prefix = "[SIMULATION] " if simulate_only else ""
+
+            # Debug: Log what we received
+            sg_keys = list(selected_groups.keys())
+            st_keys = list(selected_types.keys()) if selected_types else 'None'
+            ssg_list = list(selected_stream_groups)
+            sef_list = list(selected_edge_fleets)
+            yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}DEBUG: selected_groups keys = {sg_keys}'})}\n\n"
+            yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}DEBUG: selected_types keys = {st_keys}'})}\n\n"
+            yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}DEBUG: selected_stream_groups = {ssg_list}'})}\n\n"
+            yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}DEBUG: selected_edge_fleets = {sef_list}'})}\n\n"
+
+            # Get worker groups from source
+            yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}Discovering source worker groups...', 'current': 0, 'total': 0})}\n\n"
+
+            source_groups = []
+            source_edge_fleets = []
+
+            # Get Stream worker groups
+            try:
+                stream_groups_url = f"{source_base_url}/api/v1/master/groups"
+                yield emit_curl_command('GET', stream_groups_url, 'List Stream worker groups', 'source')
+                response = requests.get(stream_groups_url, headers=source_headers, timeout=10)
+                yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}DEBUG: Stream groups API response status: {response.status_code}'})}\n\n"
+                if response.ok:
+                    groups_data = response.json()
+                    all_groups = [g.get('id') for g in groups_data.get('items', [])]
+                    yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}DEBUG: API returned all_groups = {all_groups}'})}\n\n"
+                    yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}DEBUG: User selected_stream_groups = {list(selected_stream_groups)}'})}\n\n"
+                    # Filter groups based on user selection (case-insensitive)
+                    if selected_stream_groups:
+                        # Create lowercase mapping for case-insensitive matching
+                        selected_lower = {s.lower(): s for s in selected_stream_groups}
+                        source_groups = []
+                        for g in all_groups:
+                            if g.lower() in selected_lower:
+                                source_groups.append(g)  # Use the actual API group name
+                        yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}DEBUG: After case-insensitive filtering, source_groups = {source_groups}'})}\n\n"
+                        # If still no matches, use the selected groups directly (they might not be listed in API)
+                        if not source_groups:
+                            source_groups = list(selected_stream_groups)
+                            yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}DEBUG: No API matches, using selected_stream_groups directly'})}\n\n"
+                    elif not selected_groups:  # No selection means all
+                        source_groups = all_groups
+                        yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}DEBUG: No selection, using all source_groups = {source_groups}'})}\n\n"
+                    else:
+                        yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}DEBUG: selected_groups not empty but no stream groups matched - edge-only migration'})}\n\n"
+                        source_groups = []  # No stream groups needed for edge-only migration
+                else:
+                    yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}DEBUG: Stream groups API failed: {response.text[:200]}'})}\n\n"
+            except Exception as e:
+                yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}DEBUG: Stream groups API exception: {str(e)}'})}\n\n"
+
+            # Get Edge fleets
+            try:
+                response = requests.get(f"{source_base_url}/api/v1/products/edge/groups", headers=source_headers, timeout=10)
+                yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}DEBUG: Edge fleets API response status: {response.status_code}'})}\n\n"
+                if response.ok:
+                    fleets_data = response.json()
+                    # Handle different response formats (list vs items array)
+                    if isinstance(fleets_data, list):
+                        all_fleets = [f.get('id', f) if isinstance(f, dict) else f for f in fleets_data]
+                    else:
+                        all_fleets = [f.get('id') for f in fleets_data.get('items', [])]
+                    yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}DEBUG: API returned all_fleets = {all_fleets}'})}\n\n"
+                    yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}DEBUG: User selected_edge_fleets = {list(selected_edge_fleets)}'})}\n\n"
+                    # Filter fleets based on user selection (case-insensitive)
+                    if selected_edge_fleets:
+                        # Create lowercase mapping for case-insensitive matching
+                        selected_lower = {s.lower(): s for s in selected_edge_fleets}
+                        source_edge_fleets = []
+                        for f in all_fleets:
+                            if f.lower() in selected_lower:
+                                source_edge_fleets.append(f)  # Use the actual API fleet name
+                        yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}DEBUG: After case-insensitive filtering, source_edge_fleets = {source_edge_fleets}'})}\n\n"
+                        # If still no matches, use the selected fleets directly
+                        if not source_edge_fleets:
+                            source_edge_fleets = list(selected_edge_fleets)
+                            yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}DEBUG: No API matches, using selected_edge_fleets directly'})}\n\n"
+                    elif not selected_groups:  # No selection means all
+                        source_edge_fleets = all_fleets
+                        yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}DEBUG: No selection, using all source_edge_fleets = {source_edge_fleets}'})}\n\n"
+                    else:
+                        yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}DEBUG: selected_groups not empty but no edge fleets matched - stream-only migration'})}\n\n"
+                        source_edge_fleets = []  # No edge fleets needed for stream-only migration
+                else:
+                    yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}DEBUG: Edge fleets API failed: {response.text[:200]}'})}\n\n"
+            except Exception as e:
+                yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}DEBUG: Edge fleets API exception: {str(e)}'})}\n\n"
+
+            # All available migration types with their frontend IDs
+            # Core config types
+            all_config_types = [
+                {'id': 'pipelines', 'path': '/pipelines', 'name': 'Pipelines'},
+                {'id': 'routes', 'path': '/routes', 'name': 'Routes'},
+                {'id': 'inputs', 'path': '/inputs', 'name': 'Inputs'},
+                {'id': 'outputs', 'path': '/outputs', 'name': 'Outputs'},
+                {'id': 'lookups', 'path': '/system/lookups', 'name': 'Lookups'},
+            ]
+
+            # Knowledge types (lib items)
+            all_knowledge_types = [
+                {'id': 'parsers', 'path': '/lib/parsers', 'name': 'Parsers'},
+                {'id': 'breakers', 'path': '/lib/breakers', 'name': 'Event Breakers'},
+                {'id': 'regexes', 'path': '/lib/regexes', 'name': 'Regexes'},
+                {'id': 'grokPatterns', 'path': '/lib/grokPatterns', 'name': 'Grok Patterns'},
+                {'id': 'schemas', 'path': '/lib/schemas', 'name': 'Schemas'},
+                {'id': 'parquetSchemas', 'path': '/lib/parquetSchemas', 'name': 'Parquet Schemas'},
+                {'id': 'globalVars', 'path': '/lib/vars', 'name': 'Global Variables'},
+                {'id': 'dbConnections', 'path': '/lib/database-connections', 'name': 'Database Connections'},
+                {'id': 'appscopeConfigs', 'path': '/lib/appscope-configs', 'name': 'AppScope Configs'},
+            ]
+
+            # Filter config types based on user selection
+            config_types = []
+            if selected_types:
+                for ct in all_config_types:
+                    if selected_types.get(ct['id'], False):
+                        config_types.append(ct)
+            else:
+                config_types = all_config_types
+
+            # Filter knowledge types based on user selection
+            knowledge_types = []
+            if selected_types:
+                for kt in all_knowledge_types:
+                    if selected_types.get(kt['id'], False):
+                        knowledge_types.append(kt)
+            else:
+                knowledge_types = all_knowledge_types
+
+            # Debug: Log what types will be searched
+            ct_ids = [ct['id'] for ct in config_types]
+            kt_ids = [kt['id'] for kt in knowledge_types]
+            yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}DEBUG: config_types = {ct_ids}'})}\n\n"
+            yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}DEBUG: knowledge_types = {kt_ids}'})}\n\n"
+            yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}DEBUG: source_groups = {source_groups}'})}\n\n"
+            yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}DEBUG: source_edge_fleets = {source_edge_fleets}'})}\n\n"
+
+            total_items = 0
+            all_items = {}
+
+            # Collect all items from source Stream worker groups
+            for group in source_groups:
+                yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}Scanning Stream group: {group}...', 'current': 0, 'total': 0})}\n\n"
+
+                # Collect config types (pipelines, routes, inputs, outputs)
+                for ct in config_types:
+                    try:
+                        ct_id = ct['id']
+                        ct_path = ct['path']
+                        ct_name = ct['name']
+                        url = f"{source_base_url}/api/v1/m/{group}{ct_path}"
+                        yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}DEBUG: Fetching {ct_id} from {group}...'})}\n\n"
+                        response = requests.get(url, headers=source_headers, timeout=10)
+                        yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}DEBUG: {ct_id} response status: {response.status_code}'})}\n\n"
+                        if response.ok:
+                            data_items = response.json()
+                            items = data_items.get('items', [])
+                            yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}DEBUG: {ct_id} found {len(items)} items'})}\n\n"
+                            if items:
+                                key = f"stream:{group}_{ct_id}"
+                                all_items[key] = {'group': group, 'product': 'stream', 'type': ct, 'items': items}
+                                total_items += len(items)
+                        else:
+                            resp_text = response.text[:200]
+                            yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}DEBUG: {ct_id} failed with response: {resp_text}'})}\n\n"
+                    except Exception as e:
+                        error_msg = f'{mode_prefix}Failed to get {ct_name} from {group}: {str(e)}'
+                        yield f"data: {json.dumps({'type': 'error', 'message': error_msg})}\n\n"
+
+                # Collect knowledge types (parsers, breakers, etc.)
+                for kt in knowledge_types:
+                    try:
+                        url = f"{source_base_url}/api/v1/m/{group}{kt['path']}"
+                        response = requests.get(url, headers=source_headers, timeout=10)
+                        if response.ok:
+                            data_items = response.json()
+                            items = data_items.get('items', [])
+                            # Filter out Cribl library items
+                            user_items = [item for item in items if item.get('lib') != 'cribl']
+                            if user_items:
+                                key = f"stream:{group}_{kt['id']}"
+                                all_items[key] = {'group': group, 'product': 'stream', 'type': kt, 'items': user_items}
+                                total_items += len(user_items)
+                    except Exception as e:
+                        kt_name = kt['name']
+                        error_msg = f'{mode_prefix}Failed to get {kt_name} from {group}: {str(e)}'
+                        yield f"data: {json.dumps({'type': 'error', 'message': error_msg})}\n\n"
+
+            # Collect from Edge fleets
+            for fleet in source_edge_fleets:
+                yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}Scanning Edge fleet: {fleet}...', 'current': 0, 'total': 0})}\n\n"
+
+                # Collect config types for Edge
+                for ct in config_types:
+                    try:
+                        url = f"{source_base_url}/api/v1/edge/fleets/{fleet}{ct['path']}"
+                        response = requests.get(url, headers=source_headers, timeout=10)
+                        if response.ok:
+                            data_items = response.json()
+                            items = data_items.get('items', [])
+                            if items:
+                                key = f"edge:{fleet}_{ct['id']}"
+                                all_items[key] = {'group': fleet, 'product': 'edge', 'type': ct, 'items': items}
+                                total_items += len(items)
+                    except Exception as e:
+                        ct_name = ct['name']
+                        error_msg = f'{mode_prefix}Failed to get {ct_name} from Edge fleet {fleet}: {str(e)}'
+                        yield f"data: {json.dumps({'type': 'error', 'message': error_msg})}\n\n"
+
+                # Collect knowledge types for Edge
+                for kt in knowledge_types:
+                    try:
+                        url = f"{source_base_url}/api/v1/edge/fleets/{fleet}{kt['path']}"
+                        response = requests.get(url, headers=source_headers, timeout=10)
+                        if response.ok:
+                            data_items = response.json()
+                            items = data_items.get('items', [])
+                            user_items = [item for item in items if item.get('lib') != 'cribl']
+                            if user_items:
+                                key = f"edge:{fleet}_{kt['id']}"
+                                all_items[key] = {'group': fleet, 'product': 'edge', 'type': kt, 'items': user_items}
+                                total_items += len(user_items)
+                    except Exception as e:
+                        kt_name = kt['name']
+                        error_msg = f'{mode_prefix}Failed to get {kt_name} from Edge fleet {fleet}: {str(e)}'
+                        yield f"data: {json.dumps({'type': 'error', 'message': error_msg})}\n\n"
+
+            # Also collect lookups from Stream groups (only if selected)
+            if not selected_types or selected_types.get('lookups', False):
+                for group in source_groups:
+                    try:
+                        url = f"{source_base_url}/api/v1/m/{group}/lookups"
+                        response = requests.get(url, headers=source_headers, timeout=10)
+                        if response.ok:
+                            lookups_data = response.json()
+                            lookups = lookups_data.get('items', [])
+                            if lookups:
+                                key = f"stream:{group}_lookups"
+                                all_items[key] = {'group': group, 'product': 'stream', 'type': {'id': 'lookups', 'path': '/lookups', 'name': 'Lookups'}, 'items': lookups}
+                                total_items += len(lookups)
+                    except:
+                        pass
+
+                # Also collect lookups from Edge fleets
+                for fleet in source_edge_fleets:
+                    try:
+                        url = f"{source_base_url}/api/v1/edge/fleets/{fleet}/lookups"
+                        response = requests.get(url, headers=source_headers, timeout=10)
+                        if response.ok:
+                            lookups_data = response.json()
+                            lookups = lookups_data.get('items', [])
+                            if lookups:
+                                key = f"edge:{fleet}_lookups"
+                                all_items[key] = {'group': fleet, 'product': 'edge', 'type': {'id': 'lookups', 'path': '/lookups', 'name': 'Lookups'}, 'items': lookups}
+                                total_items += len(lookups)
+                    except:
+                        pass
+
+            yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}Found {total_items} items to migrate', 'current': 0, 'total': total_items})}\n\n"
+
+            # Get destination groups and fleets
+            dest_groups = []
+            dest_edge_fleets = []
+            try:
+                response = requests.get(f"{dest_base_url}/api/v1/master/groups", headers=dest_headers, timeout=10)
+                if response.ok:
+                    groups_data = response.json()
+                    dest_groups = [g.get('id') for g in groups_data.get('items', [])]
+            except:
+                pass
+            try:
+                response = requests.get(f"{dest_base_url}/api/v1/products/edge/groups", headers=dest_headers, timeout=10)
+                if response.ok:
+                    fleets_data = response.json()
+                    # Handle different response formats (list vs items array)
+                    if isinstance(fleets_data, list):
+                        dest_edge_fleets = [f.get('id', f) if isinstance(f, dict) else f for f in fleets_data]
+                    else:
+                        dest_edge_fleets = [f.get('id') for f in fleets_data.get('items', [])]
+            except:
+                pass
+
+            # Track groups we've already created to avoid duplicates
+            created_groups = set()
+            created_fleets = set()
+
+            # Migrate items
+            current = 0
+            for key, data in all_items.items():
+                group = data['group']
+                product = data.get('product', 'stream')
+                kt = data['type']
+                items = data['items']
+
+                # Use group_map if provided, otherwise fall back to same name or first dest group
+                # For Edge items, use edge fleets; for Stream items, use stream groups
+                if product == 'edge':
+                    available_dest = dest_edge_fleets
+                else:
+                    available_dest = dest_groups
+
+                is_custom_name = False
+                # Build the lookup key with product prefix (e.g., "stream:groupname" or "edge:groupname")
+                group_map_key = f"{product}:{group}"
+                if group_map and group_map_key in group_map:
+                    mapped_value = group_map[group_map_key]
+                    # Handle custom destination names with __custom__: prefix
+                    if mapped_value and mapped_value.startswith('__custom__:'):
+                        target_group = mapped_value.replace('__custom__:', '', 1)
+                        is_custom_name = True
+                    else:
+                        target_group = mapped_value
+                else:
+                    # Use the source group name (will auto-create if doesn't exist in destination)
+                    target_group = group
+
+                if not target_group:
+                    yield f"data: {json.dumps({'type': 'error', 'message': f'{mode_prefix}No destination group available for {group}'})}\n\n"
+                    fail_count += len(items)
+                    current += len(items)
+                    continue
+
+                # Auto-create worker group/fleet if it doesn't exist
+                if target_group not in available_dest and not simulate_only:
+                    if product == 'edge':
+                        # Create Edge fleet if not already created
+                        if target_group not in created_fleets:
+                            yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}Creating Edge fleet: {target_group}...'})}\n\n"
+                            try:
+                                create_url = f"{dest_base_url}/api/v1/products/edge/groups"
+                                create_response = requests.post(create_url, headers=dest_headers, json={"id": target_group}, timeout=30)
+                                if create_response.ok or create_response.status_code == 409:
+                                    created_fleets.add(target_group)
+                                    dest_edge_fleets.append(target_group)
+                                    yield f"data: {json.dumps({'type': 'success', 'message': f'{mode_prefix}Created Edge fleet: {target_group}'})}\n\n"
+                                else:
+                                    yield f"data: {json.dumps({'type': 'error', 'message': f'{mode_prefix}Failed to create Edge fleet {target_group}: {create_response.text}'})}\n\n"
+                                    fail_count += len(items)
+                                    current += len(items)
+                                    continue
+                            except Exception as e:
+                                yield f"data: {json.dumps({'type': 'error', 'message': f'{mode_prefix}Error creating Edge fleet {target_group}: {str(e)}'})}\n\n"
+                                fail_count += len(items)
+                                current += len(items)
+                                continue
+                    else:
+                        # Create Stream worker group if not already created
+                        if target_group not in created_groups:
+                            yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}Creating worker group: {target_group}...'})}\n\n"
+                            try:
+                                create_url = f"{dest_base_url}/api/v1/master/groups"
+                                create_response = requests.post(create_url, headers=dest_headers, json={"id": target_group}, timeout=30)
+                                if create_response.ok or create_response.status_code == 409:
+                                    created_groups.add(target_group)
+                                    dest_groups.append(target_group)
+                                    yield f"data: {json.dumps({'type': 'success', 'message': f'{mode_prefix}Created worker group: {target_group}'})}\n\n"
+                                else:
+                                    yield f"data: {json.dumps({'type': 'error', 'message': f'{mode_prefix}Failed to create worker group {target_group}: {create_response.text}'})}\n\n"
+                                    fail_count += len(items)
+                                    current += len(items)
+                                    continue
+                            except Exception as e:
+                                yield f"data: {json.dumps({'type': 'error', 'message': f'{mode_prefix}Error creating worker group {target_group}: {str(e)}'})}\n\n"
+                                fail_count += len(items)
+                                current += len(items)
+                                continue
+
+                for item in items:
+                    current += 1
+                    item_id = item.get('id', 'unknown')
+                    kt_name = kt['name']
+
+                    # Build API paths based on product type
+                    if product == 'edge':
+                        source_api_base = f"{source_base_url}/api/v1/edge/fleets/{group}"
+                        dest_api_base = f"{dest_base_url}/api/v1/edge/fleets/{target_group}"
+                    else:
+                        source_api_base = f"{source_base_url}/api/v1/m/{group}"
+                        dest_api_base = f"{dest_base_url}/api/v1/m/{target_group}"
+
+                    # Build descriptive product/group labels for logging
+                    product_label = 'Edge fleet' if product == 'edge' else 'Stream group'
+                    source_label = f"{product_label} '{group}'"
+                    target_label = f"{product_label} '{target_group}'"
+
+                    # Handle simulate mode
+                    if simulate_only:
+                        phase_msg = f'{mode_prefix}Would migrate {kt_name}: {item_id} ({source_label} -> {target_label})'
+                        yield f"data: {json.dumps({'type': 'progress', 'phase': phase_msg, 'current': current, 'total': total_items})}\n\n"
+                        success_count += 1
+                        yield f"data: {json.dumps({'type': 'success', 'message': f'{mode_prefix}Would migrate {kt_name}: {item_id} from {source_label} to {target_label}'})}\n\n"
+                        continue
+
+                    phase_msg = f'{mode_prefix}Migrating {kt_name}: {item_id} ({source_label} -> {target_label})'
+                    yield f"data: {json.dumps({'type': 'progress', 'phase': phase_msg, 'current': current, 'total': total_items})}\n\n"
+
+                    try:
+                        if kt['id'] == 'lookups':
+                            # For lookups, we need to download content and upload via 2-step process
+                            # Step 1: Download the lookup content from source
+                            download_url = f"{source_api_base}/system/lookups/{item_id}/content?raw=1"
+                            response = requests.get(download_url, headers=source_headers, timeout=60)
+                            if response.ok:
+                                csv_content = response.text
+
+                                # Step 2: Upload CSV to temp file on destination
+                                upload_url = f"{dest_api_base}/system/lookups?filename={item_id}"
+                                upload_headers = {
+                                    "Authorization": f"Bearer {dest_token}",
+                                    "Content-Type": "text/csv"
+                                }
+                                upload_response = requests.put(upload_url, headers=upload_headers, data=csv_content.encode('utf-8'), timeout=60)
+
+                                if upload_response.status_code in [200, 201]:
+                                    temp_file_response = upload_response.json()
+                                    temp_file_name = temp_file_response.get('filename')
+
+                                    # Step 3: Create/update lookup definition
+                                    lookup_def_url = f"{dest_api_base}/system/lookups"
+                                    lookup_headers = {
+                                        "Authorization": f"Bearer {dest_token}",
+                                        "Content-Type": "application/json"
+                                    }
+                                    payload = {
+                                        "id": item_id,
+                                        "fileInfo": {"filename": temp_file_name}
+                                    }
+
+                                    # Try POST first (create new)
+                                    def_response = requests.post(lookup_def_url, headers=lookup_headers, json=payload, timeout=30)
+
+                                    if def_response.status_code == 409 or (def_response.status_code == 500 and 'already exists' in def_response.text.lower()):
+                                        # Lookup exists, update it with PATCH
+                                        patch_url = f"{lookup_def_url}/{item_id}"
+                                        def_response = requests.patch(patch_url, headers=lookup_headers, json={"fileInfo": {"filename": temp_file_name}}, timeout=30)
+
+                                    if def_response.ok:
+                                        success_count += 1
+                                        yield f"data: {json.dumps({'type': 'success', 'message': f'{mode_prefix}Migrated lookup: {item_id} ({source_label} -> {target_label})'})}\n\n"
+                                        # Track for rollback
+                                        migrated_items.append({
+                                            'item_id': item_id,
+                                            'item_type': kt['name'],
+                                            'item_type_path': kt['path'],
+                                            'product': product,
+                                            'source_group': group,
+                                            'dest_group': target_group
+                                        })
+                                    else:
+                                        fail_count += 1
+                                        yield f"data: {json.dumps({'type': 'error', 'message': f'{mode_prefix}Failed to create lookup definition {item_id}: {def_response.text}'})}\n\n"
+                                else:
+                                    fail_count += 1
+                                    yield f"data: {json.dumps({'type': 'error', 'message': f'{mode_prefix}Failed to upload lookup {item_id}: {upload_response.text}'})}\n\n"
+                            else:
+                                fail_count += 1
+                                yield f"data: {json.dumps({'type': 'error', 'message': f'{mode_prefix}Failed to download lookup {item_id}: {response.status_code}'})}\n\n"
+                        else:
+                            # For other types, POST the item
+                            post_url = f"{dest_api_base}{kt['path']}"
+                            # Clean the item for posting
+                            post_item = {k: v for k, v in item.items() if k not in ['_raw', 'lib']}
+                            response = requests.post(post_url, headers=dest_headers, json=post_item, timeout=10)
+                            if response.ok:
+                                success_count += 1
+                                success_msg = f'{mode_prefix}Migrated {kt_name}: {item_id} ({source_label} -> {target_label})'
+                                yield f"data: {json.dumps({'type': 'success', 'message': success_msg})}\n\n"
+                                # Track for rollback
+                                migrated_items.append({
+                                    'item_id': item_id,
+                                    'item_type': kt['name'],
+                                    'item_type_path': kt['path'],
+                                    'product': product,
+                                    'source_group': group,
+                                    'dest_group': target_group
+                                })
+                            else:
+                                fail_count += 1
+                                yield f"data: {json.dumps({'type': 'error', 'message': f'{mode_prefix}Failed to migrate {item_id}: {response.text}'})}\n\n"
+                    except Exception as e:
+                        fail_count += 1
+                        yield f"data: {json.dumps({'type': 'error', 'message': f'{mode_prefix}Error migrating {item_id}: {str(e)}'})}\n\n"
+
+            # Commit changes to destination groups (skip in simulate mode)
+            if success_count > 0 and not simulate_only:
+                yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}Committing changes...', 'current': total_items, 'total': total_items})}\n\n"
+                # Commit Stream groups
+                for group in dest_groups:
+                    try:
+                        commit_url = f"{dest_base_url}/api/v1/version/{group}/commit"
+                        commit_data = {"message": f"Org migration from {source['orgId']}"}
+                        requests.post(commit_url, headers=dest_headers, json=commit_data, timeout=30)
+                    except:
+                        pass
+                # Commit Edge fleets
+                for fleet in dest_edge_fleets:
+                    try:
+                        commit_url = f"{dest_base_url}/api/v1/edge/fleets/{fleet}/commit"
+                        commit_data = {"message": f"Org migration from {source['orgId']}"}
+                        requests.post(commit_url, headers=dest_headers, json=commit_data, timeout=30)
+                    except:
+                        pass
+
+            # Save migration history for rollback (only if not simulate and items were migrated)
+            migration_id = None
+            if not simulate_only and migrated_items:
+                try:
+                    migration_id = save_migration_session(
+                        source_org=source.get('orgId', ''),
+                        dest_org=destination.get('orgId', ''),
+                        dest_client_id=destination.get('clientId', ''),
+                        dest_client_secret=destination.get('clientSecret', ''),
+                        simulate_only=simulate_only,
+                        success_count=success_count,
+                        fail_count=fail_count
+                    )
+                    for item in migrated_items:
+                        save_migration_item(
+                            migration_id=migration_id,
+                            item_id=item['item_id'],
+                            item_type=item['item_type'],
+                            item_type_path=item['item_type_path'],
+                            product=item['product'],
+                            source_group=item['source_group'],
+                            dest_group=item['dest_group']
+                        )
+                    yield f"data: {json.dumps({'type': 'info', 'message': f'Migration history saved (ID: {migration_id}) - {len(migrated_items)} items can be rolled back'})}\n\n"
+                except Exception as e:
+                    yield f"data: {json.dumps({'type': 'warning', 'message': f'Failed to save migration history: {str(e)}'})}\n\n"
+
+            yield f"data: {json.dumps({'type': 'complete', 'success_count': success_count, 'fail_count': fail_count, 'migration_id': migration_id})}\n\n"
+
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'message': f'Migration failed: {str(e)}'})}\n\n"
+            yield f"data: {json.dumps({'type': 'complete', 'success_count': success_count, 'fail_count': fail_count})}\n\n"
+
+    return Response(generate(), mimetype='text/event-stream')
+
+@app.route('/api/org-migration/history', methods=['GET'])
+def get_migration_history_api():
+    """Get recent migration history for rollback purposes."""
+    try:
+        limit = request.args.get('limit', 50, type=int)
+        history = get_migration_history(limit)
+        return jsonify({'success': True, 'history': history})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/org-migration/history/<int:migration_id>/items', methods=['GET'])
+def get_migration_items_api(migration_id):
+    """Get all items from a specific migration."""
+    try:
+        items = get_migration_items(migration_id)
+        return jsonify({'success': True, 'items': items})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/org-migration/rollback/<int:migration_id>', methods=['POST'])
+def rollback_migration(migration_id):
+    """Rollback a migration by deleting migrated items from destination."""
+    data = request.get_json()
+    dest_client_id = data.get('clientId')
+    dest_client_secret = data.get('clientSecret')
+    dest_org_id = data.get('orgId')
+
+    if not all([dest_client_id, dest_client_secret, dest_org_id]):
+        return jsonify({'error': 'Missing destination credentials'}), 400
+
+    def generate():
+        success_count = 0
+        fail_count = 0
+
+        try:
+            # Get migration items
+            items = get_migration_items(migration_id)
+            if not items:
+                yield f"data: {json.dumps({'type': 'error', 'message': 'No items found to rollback'})}\n\n"
+                yield f"data: {json.dumps({'type': 'complete', 'success_count': 0, 'fail_count': 0})}\n\n"
+                return
+
+            # Authenticate with destination org
+            yield f"data: {json.dumps({'type': 'progress', 'phase': 'Authenticating with destination org...', 'current': 0, 'total': len(items)})}\n\n"
+            dest_token = get_token_for_org(dest_client_id, dest_client_secret)
+            dest_base_url = get_base_url_for_org(dest_org_id)
+            dest_headers = {"Authorization": f"Bearer {dest_token}"}
+
+            yield f"data: {json.dumps({'type': 'info', 'message': f'Found {len(items)} items to rollback'})}\n\n"
+
+            # Delete each item from destination
+            for idx, item in enumerate(items):
+                item_id = item['item_id']
+                item_type = item['item_type']
+                item_type_path = item['item_type_path']
+                product = item['product']
+                dest_group = item['dest_group']
+
+                yield f"data: {json.dumps({'type': 'progress', 'phase': f'Rolling back {item_type}: {item_id}...', 'current': idx + 1, 'total': len(items)})}\n\n"
+
+                try:
+                    # Determine the delete URL based on product type
+                    if product == 'edge':
+                        if item_type == 'Lookups':
+                            delete_url = f"{dest_base_url}/api/v1/edge/fleets/{dest_group}/system/lookups/{item_id}"
+                        else:
+                            delete_url = f"{dest_base_url}/api/v1/edge/fleets/{dest_group}{item_type_path}/{item_id}"
+                    else:  # stream or search
+                        if item_type == 'Lookups':
+                            delete_url = f"{dest_base_url}/api/v1/m/{dest_group}/system/lookups/{item_id}"
+                        else:
+                            delete_url = f"{dest_base_url}/api/v1/m/{dest_group}{item_type_path}/{item_id}"
+
+                    response = requests.delete(delete_url, headers=dest_headers, timeout=30)
+
+                    if response.ok or response.status_code == 404:
+                        success_count += 1
+                        mark_item_rolled_back(item['id'])
+                        status_msg = "deleted" if response.ok else "not found (already deleted?)"
+                        yield f"data: {json.dumps({'type': 'success', 'message': f'Rolled back {item_type}: {item_id} ({status_msg})'})}\n\n"
+                    else:
+                        fail_count += 1
+                        yield f"data: {json.dumps({'type': 'error', 'message': f'Failed to rollback {item_id}: {response.text}'})}\n\n"
+                except Exception as e:
+                    fail_count += 1
+                    yield f"data: {json.dumps({'type': 'error', 'message': f'Error rolling back {item_id}: {str(e)}'})}\n\n"
+
+            # Commit changes to destination
+            if success_count > 0:
+                yield f"data: {json.dumps({'type': 'progress', 'phase': 'Committing rollback changes...', 'current': len(items), 'total': len(items)})}\n\n"
+
+                # Collect unique groups/fleets to commit
+                groups_to_commit = set()
+                fleets_to_commit = set()
+                for item in items:
+                    if item['product'] == 'edge':
+                        fleets_to_commit.add(item['dest_group'])
+                    else:
+                        groups_to_commit.add(item['dest_group'])
+
+                # Commit Stream groups
+                for group in groups_to_commit:
+                    try:
+                        commit_url = f"{dest_base_url}/api/v1/version/{group}/commit"
+                        commit_data = {"message": f"Rollback migration {migration_id}"}
+                        requests.post(commit_url, headers=dest_headers, json=commit_data, timeout=30)
+                    except:
+                        pass
+
+                # Commit Edge fleets
+                for fleet in fleets_to_commit:
+                    try:
+                        commit_url = f"{dest_base_url}/api/v1/edge/fleets/{fleet}/commit"
+                        commit_data = {"message": f"Rollback migration {migration_id}"}
+                        requests.post(commit_url, headers=dest_headers, json=commit_data, timeout=30)
+                    except:
+                        pass
+
+                # Update migration status
+                if fail_count == 0:
+                    update_migration_status(migration_id, 'rolled_back')
+                else:
+                    update_migration_status(migration_id, 'partially_rolled_back')
+
+            yield f"data: {json.dumps({'type': 'complete', 'success_count': success_count, 'fail_count': fail_count})}\n\n"
+
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'message': f'Rollback failed: {str(e)}'})}\n\n"
+            yield f"data: {json.dumps({'type': 'complete', 'success_count': success_count, 'fail_count': fail_count})}\n\n"
+
+    return Response(generate(), mimetype='text/event-stream')
+
+# =============================================================================
+# SNAPSHOTS API - POC Configuration Backup/Restore
+# =============================================================================
+
+@app.route('/api/snapshots', methods=['GET'])
+def api_list_snapshots():
+    """Get all snapshots."""
+    try:
+        snapshots = list_snapshots()
+        return jsonify({'success': True, 'snapshots': snapshots})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/snapshots', methods=['POST'])
+def api_create_snapshot():
+    """Create a new snapshot by capturing configs from a source organization."""
+    data = request.get_json()
+
+    name = data.get('name')
+    description = data.get('description', '')
+    client_id = data.get('clientId')
+    client_secret = data.get('clientSecret')
+    org_id = data.get('orgId')
+    worker_group = data.get('workerGroup', 'default')
+    product = data.get('product', 'stream')
+    config_types = data.get('configTypes', [])  # List of config types to capture
+
+    if not all([name, client_id, client_secret, org_id]):
+        return jsonify({'error': 'Missing required fields: name, clientId, clientSecret, orgId'}), 400
+
+    def generate():
+        try:
+            # Normalize org_id
+            normalized_org = org_id.replace('https://', '').replace('http://', '').replace('.cribl.cloud/', '').replace('.cribl.cloud', '')
+            base_url = f"https://{normalized_org}.cribl.cloud"
+
+            # Get OAuth token
+            yield f"data: {json.dumps({'type': 'status', 'message': 'Authenticating...'})}\n\n"
+            token_url = f"{base_url}/api/v1/auth/oauth/token"
+            token_response = requests.post(token_url, data={
+                'grant_type': 'client_credentials',
+                'client_id': client_id,
+                'client_secret': client_secret,
+                'audience': f'{base_url}/api'
+            }, timeout=30)
+
+            if token_response.status_code != 200:
+                yield f"data: {json.dumps({'type': 'error', 'message': f'Authentication failed: {token_response.text}'})}\n\n"
+                return
+
+            access_token = token_response.json().get('access_token')
+            headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
+
+            # Get product version
+            yield f"data: {json.dumps({'type': 'status', 'message': 'Getting product version...'})}\n\n"
+            try:
+                version_url = f"{base_url}/api/v1/system/info"
+                version_resp = requests.get(version_url, headers=headers, timeout=30)
+                product_version = version_resp.json().get('version', 'unknown') if version_resp.ok else 'unknown'
+            except:
+                product_version = 'unknown'
+
+            # Define config type mappings
+            config_mappings = {
+                'packs': f'/api/v1/m/{worker_group}/packs',
+                'lookups': f'/api/v1/m/{worker_group}/system/lookups',
+                'pipelines': f'/api/v1/m/{worker_group}/pipelines',
+                'routes': f'/api/v1/m/{worker_group}/routes',
+                'inputs': f'/api/v1/m/{worker_group}/inputs',
+                'outputs': f'/api/v1/m/{worker_group}/outputs',
+                'breakers': f'/api/v1/m/{worker_group}/lib/breakers',
+                'parsers': f'/api/v1/m/{worker_group}/lib/parsers',
+                'vars': f'/api/v1/m/{worker_group}/lib/vars',
+                'regex': f'/api/v1/m/{worker_group}/lib/regex',
+                'grokPatterns': f'/api/v1/m/{worker_group}/lib/grokPatterns',
+                'schemas': f'/api/v1/m/{worker_group}/lib/schemas',
+                'parquetSchemas': f'/api/v1/m/{worker_group}/lib/parquetSchemas',
+                'database-connections': f'/api/v1/m/{worker_group}/lib/database-connections',
+                'hmac': f'/api/v1/m/{worker_group}/lib/hmac',
+                'globalVars': f'/api/v1/m/{worker_group}/lib/vars',
+                'notifications': f'/api/v1/notifications',
+                'notification-targets': f'/api/v1/notification-targets',
+            }
+
+            # If no specific types requested, capture all
+            if not config_types:
+                config_types = list(config_mappings.keys())
+
+            # Capture each config type
+            configs = {}
+            for config_type in config_types:
+                if config_type in config_mappings:
+                    yield f"data: {json.dumps({'type': 'status', 'message': f'Capturing {config_type}...'})}\n\n"
+                    try:
+                        url = f"{base_url}{config_mappings[config_type]}"
+                        resp = requests.get(url, headers=headers, timeout=60)
+                        if resp.ok:
+                            data = resp.json()
+                            items = data.get('items', data) if isinstance(data, dict) else data
+                            configs[config_type] = items
+                            yield f"data: {json.dumps({'type': 'progress', 'config_type': config_type, 'count': len(items) if isinstance(items, list) else 1})}\n\n"
+                        else:
+                            yield f"data: {json.dumps({'type': 'warning', 'message': f'Could not capture {config_type}: {resp.status_code}'})}\n\n"
+                    except Exception as e:
+                        yield f"data: {json.dumps({'type': 'warning', 'message': f'Error capturing {config_type}: {str(e)}'})}\n\n"
+
+            # Save snapshot to database
+            yield f"data: {json.dumps({'type': 'status', 'message': 'Saving snapshot...'})}\n\n"
+            snapshot_id = create_snapshot(
+                name=name,
+                description=description,
+                source_org_id=normalized_org,
+                source_org_name=normalized_org,
+                worker_group=worker_group,
+                product=product,
+                product_version=product_version,
+                configs=configs
+            )
+
+            yield f"data: {json.dumps({'type': 'complete', 'snapshot_id': snapshot_id, 'message': 'Snapshot created successfully'})}\n\n"
+
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+    return Response(generate(), mimetype='text/event-stream')
+
+@app.route('/api/snapshots/<int:snapshot_id>', methods=['GET'])
+def api_get_snapshot(snapshot_id):
+    """Get a specific snapshot with all its configs."""
+    try:
+        snapshot = get_snapshot(snapshot_id)
+        if not snapshot:
+            return jsonify({'error': 'Snapshot not found'}), 404
+        return jsonify({'success': True, 'snapshot': snapshot})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/snapshots/<int:snapshot_id>', methods=['PUT'])
+def api_update_snapshot(snapshot_id):
+    """Update snapshot metadata."""
+    data = request.get_json()
+    try:
+        update_snapshot(
+            snapshot_id,
+            name=data.get('name'),
+            description=data.get('description')
+        )
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/snapshots/<int:snapshot_id>', methods=['DELETE'])
+def api_delete_snapshot(snapshot_id):
+    """Delete a snapshot."""
+    try:
+        if delete_snapshot(snapshot_id):
+            return jsonify({'success': True})
+        else:
+            return jsonify({'error': 'Snapshot not found'}), 404
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/snapshots/<int:snapshot_id>/download', methods=['GET'])
+def api_download_snapshot(snapshot_id):
+    """Download a snapshot as a JSON file."""
+    try:
+        snapshot = get_snapshot(snapshot_id)
+        if not snapshot:
+            return jsonify({'error': 'Snapshot not found'}), 404
+
+        # Create a downloadable JSON response
+        response = Response(
+            json.dumps(snapshot, indent=2),
+            mimetype='application/json',
+            headers={'Content-Disposition': f'attachment; filename=snapshot_{snapshot_id}_{snapshot["name"]}.json'}
+        )
+        return response
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/snapshots/<int:snapshot_id>/restore', methods=['POST'])
+def api_restore_snapshot(snapshot_id):
+    """Restore a snapshot to a destination organization."""
+    data = request.get_json()
+
+    dest_client_id = data.get('clientId')
+    dest_client_secret = data.get('clientSecret')
+    dest_org_id = data.get('orgId')
+    dest_worker_group = data.get('workerGroup', 'default')
+    config_types = data.get('configTypes', [])  # Optional: restore only specific types
+    dry_run = data.get('dryRun', False)
+
+    if not all([dest_client_id, dest_client_secret, dest_org_id]):
+        return jsonify({'error': 'Missing destination credentials'}), 400
+
+    def generate():
+        success_count = 0
+        fail_count = 0
+
+        try:
+            # Get snapshot
+            snapshot = get_snapshot(snapshot_id)
+            if not snapshot:
+                yield f"data: {json.dumps({'type': 'error', 'message': 'Snapshot not found'})}\n\n"
+                return
+
+            # Normalize org_id
+            normalized_org = dest_org_id.replace('https://', '').replace('http://', '').replace('.cribl.cloud/', '').replace('.cribl.cloud', '')
+            base_url = f"https://{normalized_org}.cribl.cloud"
+
+            # Get OAuth token
+            yield f"data: {json.dumps({'type': 'status', 'message': 'Authenticating to destination...'})}\n\n"
+            token_url = f"{base_url}/api/v1/auth/oauth/token"
+            token_response = requests.post(token_url, data={
+                'grant_type': 'client_credentials',
+                'client_id': dest_client_id,
+                'client_secret': dest_client_secret,
+                'audience': f'{base_url}/api'
+            }, timeout=30)
+
+            if token_response.status_code != 200:
+                yield f"data: {json.dumps({'type': 'error', 'message': f'Authentication failed: {token_response.text}'})}\n\n"
+                return
+
+            access_token = token_response.json().get('access_token')
+            headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
+
+            # Define config type mappings for restore
+            config_mappings = {
+                'packs': f'/api/v1/m/{dest_worker_group}/packs',
+                'lookups': f'/api/v1/m/{dest_worker_group}/system/lookups',
+                'pipelines': f'/api/v1/m/{dest_worker_group}/pipelines',
+                'routes': f'/api/v1/m/{dest_worker_group}/routes',
+                'inputs': f'/api/v1/m/{dest_worker_group}/inputs',
+                'outputs': f'/api/v1/m/{dest_worker_group}/outputs',
+                'breakers': f'/api/v1/m/{dest_worker_group}/lib/breakers',
+                'parsers': f'/api/v1/m/{dest_worker_group}/lib/parsers',
+                'vars': f'/api/v1/m/{dest_worker_group}/lib/vars',
+                'regex': f'/api/v1/m/{dest_worker_group}/lib/regex',
+                'grokPatterns': f'/api/v1/m/{dest_worker_group}/lib/grokPatterns',
+                'schemas': f'/api/v1/m/{dest_worker_group}/lib/schemas',
+                'parquetSchemas': f'/api/v1/m/{dest_worker_group}/lib/parquetSchemas',
+                'database-connections': f'/api/v1/m/{dest_worker_group}/lib/database-connections',
+                'hmac': f'/api/v1/m/{dest_worker_group}/lib/hmac',
+                'globalVars': f'/api/v1/m/{dest_worker_group}/lib/vars',
+                'notifications': f'/api/v1/notifications',
+                'notification-targets': f'/api/v1/notification-targets',
+            }
+
+            configs = snapshot.get('configs', {})
+
+            # If specific types requested, filter
+            types_to_restore = config_types if config_types else list(configs.keys())
+
+            for config_type in types_to_restore:
+                if config_type not in configs:
+                    continue
+
+                items = configs[config_type]
+                if not items:
+                    continue
+
+                yield f"data: {json.dumps({'type': 'status', 'message': f'Restoring {config_type}...'})}\n\n"
+
+                if config_type not in config_mappings:
+                    yield f"data: {json.dumps({'type': 'warning', 'message': f'Unknown config type: {config_type}'})}\n\n"
+                    continue
+
+                base_path = config_mappings[config_type]
+
+                # Handle list of items vs single item
+                item_list = items if isinstance(items, list) else [items]
+
+                for item in item_list:
+                    item_id = item.get('id', 'unknown')
+
+                    if dry_run:
+                        yield f"data: {json.dumps({'type': 'dry_run', 'config_type': config_type, 'item_id': item_id, 'action': 'would_create'})}\n\n"
+                        success_count += 1
+                        continue
+
+                    try:
+                        url = f"{base_url}{base_path}"
+                        resp = requests.post(url, headers=headers, json=item, timeout=60)
+
+                        if resp.ok or resp.status_code == 409:  # 409 = already exists
+                            success_count += 1
+                            yield f"data: {json.dumps({'type': 'success', 'config_type': config_type, 'item_id': item_id})}\n\n"
+                        else:
+                            fail_count += 1
+                            yield f"data: {json.dumps({'type': 'failure', 'config_type': config_type, 'item_id': item_id, 'error': resp.text[:200]})}\n\n"
+                    except Exception as e:
+                        fail_count += 1
+                        yield f"data: {json.dumps({'type': 'failure', 'config_type': config_type, 'item_id': item_id, 'error': str(e)})}\n\n"
+
+            # Commit changes if not dry run
+            if not dry_run and success_count > 0:
+                yield f"data: {json.dumps({'type': 'status', 'message': 'Committing changes...'})}\n\n"
+                try:
+                    commit_url = f"{base_url}/api/v1/version/{dest_worker_group}/commit"
+                    commit_data = {"message": f"Restored from snapshot: {snapshot['name']}"}
+                    requests.post(commit_url, headers=headers, json=commit_data, timeout=30)
+                except:
+                    pass
+
+            yield f"data: {json.dumps({'type': 'complete', 'success_count': success_count, 'fail_count': fail_count})}\n\n"
+
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+    return Response(generate(), mimetype='text/event-stream')
+
+@app.route('/api/snapshots/import', methods=['POST'])
+def api_import_snapshot():
+    """Import a snapshot from a JSON file."""
+    try:
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file provided'}), 400
+
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({'error': 'No file selected'}), 400
+
+        # Read and parse the JSON file
+        content = file.read().decode('utf-8')
+        snapshot_data = json.loads(content)
+
+        # Create a new snapshot with the imported data
+        snapshot_id = create_snapshot(
+            name=snapshot_data.get('name', 'Imported Snapshot'),
+            description=snapshot_data.get('description', 'Imported from file'),
+            source_org_id=snapshot_data.get('source_org_id', 'unknown'),
+            source_org_name=snapshot_data.get('source_org_name', 'unknown'),
+            worker_group=snapshot_data.get('worker_group', 'default'),
+            product=snapshot_data.get('product', 'stream'),
+            product_version=snapshot_data.get('product_version', 'unknown'),
+            configs=snapshot_data.get('configs', {})
+        )
+
+        return jsonify({'success': True, 'snapshot_id': snapshot_id})
+    except json.JSONDecodeError:
+        return jsonify({'error': 'Invalid JSON file'}), 400
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# =============================================================================
 # MAIN ENTRY POINT
 # =============================================================================
 
@@ -5612,6 +7503,16 @@ if __name__ == '__main__':
     print("\n[MARKETPLACE] Initializing feed scheduler...")
     init_marketplace_db()
     scheduler.start()
+
+    # Initialize Migration History database (for rollback feature)
+    print("\n[MIGRATION] Initializing migration history database...")
+    init_migration_history_db()
+    print("[OK] Migration history database initialized")
+
+    # Initialize Snapshots database (for POC config backup/restore)
+    print("\n[SNAPSHOTS] Initializing snapshots database...")
+    init_snapshots_db()
+    print("[OK] Snapshots database initialized")
     load_scheduled_jobs()
     atexit.register(lambda: scheduler.shutdown())
     print("[OK] Marketplace scheduler started")

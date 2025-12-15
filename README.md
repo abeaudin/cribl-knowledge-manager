@@ -2,29 +2,62 @@
 
 A web-based tool for managing and transferring knowledge objects across Cribl Cloud environments (Stream, Search, and Edge).
 
-**Version: 4.0.0** | December 2025
+**Version: 5.0.0** | December 2025
 
 > **Note:** This tool supports **Cribl Cloud only**. On-premises Cribl deployments are not supported.
 
 ## Features
 
+### Full Organization Migration
+- **Org-to-Org Migration** - Migrate entire configurations between Cribl Cloud organizations
+- **Selective Migration** - Choose specific config types: Packs, Lookups, Pipelines, Routes, Inputs, Outputs, Global Variables, Notifications, Mappings, and all Knowledge objects
+- **Simulation Mode** - Preview migration with "Dry Run" before making changes
+- **Step-by-Step Wizard** - Guided workflow: Connect → Select → Review → Migrate → Done
+- **Real-time Progress** - Item-by-item status tracking with success/error indicators
+- **SSL Verification Toggle** - Configure SSL verification per environment
+
+### Knowledge Object Management
 - **Transfer Knowledge Objects** between Worker Groups, Fleets, and Search
-- **Supported Object Types:**
-  - Lookups (CSV files)
-  - Event Breakers
-  - Parsers
-  - Variables / Macros
-  - Regexes
-  - Grok Patterns
-  - Schemas / Parquet Schemas
-  - Database Connections
-  - HMAC Functions
-  - AppScope Configs
-  - Guard Rules (SDS)
+- **Cross-Product Support** - Transfer between Stream, Edge, and Search
+- **Multi-Destination Transfer** - Send to multiple Worker Groups/Fleets at once
+- **Pack Lookup Scanning** - Automatically discover and extract lookups from installed Packs
+
+### Pack Marketplace
+- **Browse Packs** - Explore available Cribl Packs from the official feed
+- **Search & Filter** - Find packs by name, description, or author
+- **Pack Details** - View descriptions, versions, and compatibility info
+- **Quick Install** - Download and install packs directly to your environments
+
+### Supported Object Types
+- **Lookups** (CSV files) - Memory or Disk-based
+- **Event Breakers** - Rulesets for parsing raw data
+- **Parsers** - Field extraction configurations
+- **Variables / Macros** - Reusable values and expressions
+- **Regexes** - Regular expression patterns
+- **Grok Patterns** - Named regex patterns for parsing
+- **Schemas** - Field definitions and mappings
+- **Parquet Schemas** - Column definitions for Parquet files
+- **Database Connections** - External database configurations
+- **HMAC Functions** - Hash-based message authentication
+- **AppScope Configs** - Application instrumentation settings
+- **Guard Rules (SDS)** - Sensitive data scrubbing rules
+
+### Editing & Workflow
 - **Edit Before Transfer** - Modify objects, rename IDs, and change libraries before deploying
+- **Built-in JSON Editor** - Syntax highlighting for knowledge objects
+- **Table Editor** - Smart CSV editing with:
+  - Auto-sizing columns based on content
+  - Word wrap toggle for long content
+  - Resizable column handles
+  - Tables fill panel width
 - **Bulk Operations** - Select and transfer multiple objects at once
-- **Built-in Editor** - JSON editor with syntax highlighting for knowledge objects
-- **Activity Logging** - Track all operations with console output and curl command history
+- **Pending Deployments** - Stage changes, then commit and deploy together
+- **Persistent State** - Pending deployments saved to browser localStorage
+
+### Developer Tools
+- **Console Panel** - Real-time API activity logging
+- **curl Commands Panel** - View equivalent HTTP requests for all operations
+- **Activity Logging** - Track all operations with timestamps
 
 ## Requirements
 
@@ -109,6 +142,25 @@ Accepted formats:
 
 - **Backend:** Flask server (`app.py`) - handles OAuth authentication and proxies Cribl Cloud API calls
 - **Frontend:** Single-file React SPA (`index.html`) - no build step required
+
+## Related Tools
+
+### migrate_configs.py (Professional Services Script)
+
+The repository also includes `migrate_configs.py`, a comprehensive configuration migration script from Cribl Professional Services. This script handles full configuration migration including:
+
+- Routes, Pipelines, Inputs, Outputs
+- Packs (full pack migration)
+- Notifications & Notification Targets
+- Mappings & Fleet Mappings
+- All knowledge objects
+
+**Use Cases:**
+- On-premises to Cribl Cloud migration
+- Full environment cloning
+- Bulk configuration backup/restore
+
+See `conf.json` for configuration options. Requires the `cribl_python_api_wrapper` package.
 
 ## License
 

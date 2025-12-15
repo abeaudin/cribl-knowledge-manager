@@ -49,7 +49,7 @@ https://main-amazing-varahamihira.cribl.cloud
        This is your Organization ID
 ```
 
-⚠️ **Important:** Include the workspace prefix! It's usually `main-` followed by your organization name.
+**Important:** Include the workspace prefix! It's usually `main-` followed by your organization name.
 
 Accepted formats:
 - `main-your-org-name`
@@ -101,9 +101,12 @@ The app will:
 ### Lookups Tab
 
 1. Select **Source** product (Stream, Edge, or Search) and Worker Group
-2. Select **Destination** product and Worker Group(s)
-3. Choose lookup files to transfer
-4. Click **Transfer** to copy lookups to the destination
+2. Click **Scan Packs** to discover lookups inside installed Packs
+3. Select **Destination** product and Worker Group(s)
+4. Choose lookup files to transfer
+5. Optionally select **Memory** or **Disk** lookup type per file
+6. Click **Transfer** to copy lookups to the destination
+7. Click **Commit & Deploy** when ready to apply changes
 
 ### Knowledge Tab
 
@@ -115,12 +118,47 @@ The app will:
 6. Enter a **Commit Message**
 7. Click **Transfer** then **Commit & Deploy**
 
-### Tips
+### Migration Tab
 
+Migrate entire configurations between Cribl Cloud organizations:
+
+1. **Connect** - Enter source and destination organization credentials
+   - Client ID, Client Secret, and Organization ID for each
+   - Toggle SSL Verification if needed
+   - Click **Connect** to validate credentials
+2. **Select** - Choose what to migrate:
+   - Packs, Lookups, Pipelines, Routes
+   - Inputs, Outputs, Global Variables
+   - Notifications, Mappings, Knowledge objects
+3. **Review** - Preview items that will be migrated
+4. **Migrate** - Execute the migration
+   - Enable **Dry Run** to simulate without making changes
+   - Watch real-time progress with item-by-item status
+5. **Done** - Review results and check for any errors
+
+### Marketplace Tab
+
+Browse and install Cribl Packs:
+
+1. Browse the **Pack Catalog** from Cribl's official feed
+2. Use **Search** to filter by name, description, or author
+3. Click a pack to view details, versions, and compatibility
+4. Click **Install** to download and deploy to your environment
+5. Select the target **Worker Group** or **Fleet**
+
+### Key Features
+
+- **Pack Lookups**: Click "Scan Packs" to discover lookups embedded in Packs
 - **Cribl Badge**: Items with a purple "Cribl" badge are built-in library objects
-- **Edit Before Transfer**: Click the edit icon to rename objects or change their library
-- **Console Panel**: Shows API activity and any errors
-- **curl Commands Panel**: Shows the equivalent curl commands for each API call
+- **Edit Before Transfer**: Click the edit icon to rename objects or modify content
+- **Table Editor**: For CSV lookups, use the smart table editor with auto-sizing columns
+- **Multi-Destination**: Select multiple Worker Groups/Fleets to transfer to all at once
+- **Pending Deployments**: Transfers are staged - commit and deploy when ready
+
+### Bottom Panels
+
+- **Console**: Shows real-time API activity and any errors
+- **curl Commands**: Shows the equivalent HTTP requests for API debugging
 
 ## Troubleshooting
 
@@ -139,6 +177,10 @@ The app will:
 ### Application Won't Start
 - Ensure Python 3.8+ is installed: `python3 --version`
 - Try reinstalling dependencies: `pip install -r requirements.txt`
+
+### Pack Lookups Not Found
+- Click "Scan Packs" button to discover pack lookups
+- Pack lookups are shown with pack name prefix (e.g., `HelloPacks.lookup.csv`)
 
 ## Next Steps
 
