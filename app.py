@@ -166,8 +166,8 @@ app = Flask(__name__)
 # This prevents Cross-Site Request Forgery (CSRF) attacks
 CORS(app, 
      origins=[
-         'http://localhost:42002',
-         'http://127.0.0.1:42002',
+         'http://localhost:42001',
+         'http://127.0.0.1:42001',
          'http://localhost:*',  # Allow any localhost port for development
          'http://127.0.0.1:*'
      ],
@@ -2309,7 +2309,7 @@ def add_security_headers(response):
     # Enable XSS protection
     response.headers['X-XSS-Protection'] = '1; mode=block'
     # Content Security Policy (restrictive)
-    response.headers['Content-Security-Policy'] = "default-src 'self' 'unsafe-inline' 'unsafe-eval' https://unpkg.com https://cdn.tailwindcss.com https://cdnjs.cloudflare.com; img-src 'self' data:; connect-src 'self' http://localhost:* http://127.0.0.1:* https://*.cribl.cloud;"
+    response.headers['Content-Security-Policy'] = "default-src 'self' 'unsafe-inline' 'unsafe-eval' https://unpkg.com https://cdnjs.cloudflare.com https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com; img-src 'self' data:; connect-src 'self' http://localhost:* http://127.0.0.1:* https://*.cribl.cloud https://unpkg.com;"
     # Referrer policy
     response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
     return response
@@ -6209,7 +6209,7 @@ def is_port_available(port):
     except OSError:
         return False
 
-def get_available_port(preferred_port=42002):
+def get_available_port(preferred_port=42001):
     """
     Get an available port, prompting user if preferred port is in use.
 
@@ -6412,11 +6412,36 @@ def migrate_org():
     selected_groups = data.get('selectedGroups', {})  # Dict of group_id -> boolean
     group_map = data.get('groupMap', {})  # Dict of source_group -> dest_group
     simulate_only = data.get('simulateOnly', False)  # Dry run mode
+    include_all_knowledge = data.get('includeAllKnowledge', False)  # Auto-include all knowledge with pipelines
 
     def generate():
         success_count = 0
         fail_count = 0
         migrated_items = []  # Track successfully migrated items for rollback
+        detected_secrets = set()  # Track secret references found in configs
+
+        def extract_secrets_from_config(config_data):
+            """Scan config JSON for secret references ($secret:name or ${secret:name})"""
+            secrets = set()
+            if config_data is None:
+                return secrets
+
+            config_str = json.dumps(config_data) if isinstance(config_data, (dict, list)) else str(config_data)
+
+            # Match patterns: $secret:name, ${secret:name}, ${secret:name:default}
+            import re
+            # Pattern for $secret:secretName or ${secret:secretName} or ${secret:secretName:default}
+            patterns = [
+                r'\$secret:([a-zA-Z0-9_-]+)',  # $secret:name
+                r'\$\{secret:([a-zA-Z0-9_-]+)(?::[^}]*)?\}',  # ${secret:name} or ${secret:name:default}
+            ]
+
+            for pattern in patterns:
+                matches = re.findall(pattern, config_str)
+                for match in matches:
+                    secrets.add(match)
+
+            return secrets
 
         def emit_curl_command(method, url, description, target='source', body=None):
             """Emit a curl_command SSE event for the frontend curl Commands panel."""
@@ -6580,8 +6605,13 @@ def migrate_org():
                 config_types = all_config_types
 
             # Filter knowledge types based on user selection
+            # If includeAllKnowledge is enabled with pipelines, include all knowledge types
             knowledge_types = []
-            if selected_types:
+            if include_all_knowledge and selected_types.get('pipelines', False):
+                # Include all knowledge types when auto-include is enabled with pipelines
+                knowledge_types = all_knowledge_types
+                yield f"data: {json.dumps({'type': 'progress', 'phase': f'{mode_prefix}Auto-including all knowledge objects with pipelines...'})}\n\n"
+            elif selected_types:
                 for kt in all_knowledge_types:
                     if selected_types.get(kt['id'], False):
                         knowledge_types.append(kt)
@@ -6831,6 +6861,9 @@ def migrate_org():
                     item_id = item.get('id', 'unknown')
                     kt_name = kt['name']
 
+                    # Extract secret references from the item config
+                    detected_secrets.update(extract_secrets_from_config(item))
+
                     # Build API paths based on product type
                     if product == 'edge':
                         source_api_base = f"{source_base_url}/api/v1/edge/fleets/{group}"
@@ -6989,11 +7022,11 @@ def migrate_org():
                 except Exception as e:
                     yield f"data: {json.dumps({'type': 'warning', 'message': f'Failed to save migration history: {str(e)}'})}\n\n"
 
-            yield f"data: {json.dumps({'type': 'complete', 'success_count': success_count, 'fail_count': fail_count, 'migration_id': migration_id})}\n\n"
+            yield f"data: {json.dumps({'type': 'complete', 'success_count': success_count, 'fail_count': fail_count, 'migration_id': migration_id, 'detected_secrets': list(detected_secrets)})}\n\n"
 
         except Exception as e:
             yield f"data: {json.dumps({'type': 'error', 'message': f'Migration failed: {str(e)}'})}\n\n"
-            yield f"data: {json.dumps({'type': 'complete', 'success_count': success_count, 'fail_count': fail_count})}\n\n"
+            yield f"data: {json.dumps({'type': 'complete', 'success_count': success_count, 'fail_count': fail_count, 'detected_secrets': list(detected_secrets)})}\n\n"
 
     return Response(generate(), mimetype='text/event-stream')
 
@@ -7518,7 +7551,7 @@ if __name__ == '__main__':
     print("[OK] Marketplace scheduler started")
 
     # Get available port
-    default_port = 42002
+    default_port = 42001
     print("\n[PORT] Checking port availability...")
     port = get_available_port(default_port)
     print(f"[OK] Using port: {port}")

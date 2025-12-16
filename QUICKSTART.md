@@ -93,7 +93,7 @@ python app.py
 
 The app will:
 1. Check dependencies (auto-install if missing)
-2. Start on `http://localhost:42002`
+2. Start on `http://localhost:42001`
 3. Open your browser automatically
 
 ## Using the Application
@@ -171,7 +171,7 @@ Browse and install Cribl Packs:
 - Check the Worker Group or Fleet name is correct
 
 ### "Connection Refused" Error
-- Make sure port 42002 is available
+- Make sure port 42001 is available
 - Check no firewall is blocking localhost connections
 
 ### Application Won't Start

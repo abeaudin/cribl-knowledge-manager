@@ -88,7 +88,7 @@ cp config.ini.template config.ini
 python app.py
 ```
 
-The application will start on `http://localhost:42002` and auto-open in your browser.
+The application will start on `http://localhost:42001` and auto-open in your browser.
 
 ## Configuration
 

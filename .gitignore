@@ -217,3 +217,12 @@ CLAUDE.md
 
 # Application config (contains credentials)
 config.ini
+
+# Node.js (Tailwind/Babel build)
+node_modules/
+package.json
+package-lock.json
+input.css
+tailwind.config.js
+babel.config.json
+src/
