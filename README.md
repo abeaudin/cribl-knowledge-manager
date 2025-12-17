@@ -70,7 +70,7 @@ See [QUICKSTART.md](QUICKSTART.md) for detailed setup instructions.
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/cribl-knowledge-manager.git
+git clone https://github.com/criblio/cribl-knowledge-manager.git
 cd cribl-knowledge-manager
 
 # Setup virtual environment
